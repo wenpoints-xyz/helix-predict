@@ -47,7 +47,9 @@
     ["ink", "ink-dim", "accent", "accent-2", "ok", "bad", "panel-2", "bevel-dk"].forEach(function (k) {
       PAL[k] = cs.getPropertyValue("--" + k).trim();
     });
+    PAL.comic = cs.getPropertyValue("--comic").trim() || "'Comic Sans MS',cursive";
   }
+  window.matchMedia("(max-width: 480px)").addEventListener("change", readPalette);
   document.documentElement.dataset.theme = localStorage.predict_theme || "dark";
   readPalette();
   $("themebtn").onclick = function () {
@@ -391,7 +393,7 @@
         var arrow = z.side === "up" ? "▲ UP" : "▼ DOWN";
         ctx.textAlign = "center";
         ctx.fillStyle = z.col;
-        ctx.font = "bold 13px 'Comic Sans MS','Comic Sans',cursive";
+        ctx.font = "bold 13px " + PAL.comic;
         ctx.fillText(arrow, zx, mid - 22);
         ctx.font = "bold 24px 'Courier New',monospace";
         ctx.fillText("×" + m.toFixed(2), zx, mid + 2);
