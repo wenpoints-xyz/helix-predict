@@ -1,0 +1,14 @@
+node_modules/
+.env
+.DS_Store
+# foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+# js build
+dist/
+.turbo/
+.gstack/
+# test artifacts
+**/test-results/
+**/playwright-report/

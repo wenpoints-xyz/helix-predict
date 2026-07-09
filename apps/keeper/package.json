@@ -1,0 +1,14 @@
+{
+  "name": "helix-predict-keeper",
+  "private": true,
+  "type": "module",
+  "description": "Keeper for PredictionHouse: creates rounds on cadence, locks/settles on Pyth, voids stuck rounds.",
+  "scripts": {
+    "start": "node src/keeper.js",
+    "once": "node src/keeper.js --once"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  }
+}

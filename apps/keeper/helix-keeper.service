@@ -1,0 +1,24 @@
+[Unit]
+Description=helix-predict keeper (PredictionHouse rounds: create/lock/settle/void)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated, low-privilege user that owns ONLY the keeper dir + its .env (chmod 600).
+User=helixkeeper
+Group=helixkeeper
+WorkingDirectory=/opt/helix-predict/apps/keeper
+EnvironmentFile=/opt/helix-predict/apps/keeper/.env
+ExecStart=/usr/local/bin/node src/keeper.js
+Restart=always
+RestartSec=5
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/helix-predict/apps/keeper
+
+[Install]
+WantedBy=multi-user.target

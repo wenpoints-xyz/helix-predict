@@ -143,11 +143,31 @@
     <button class="chip" data-v="50">50</button>
     <button class="chip" data-v="100">100</button>
     <button class="chip" data-v="max">MAX</button>
-    <span class="balwrap">bal <b id="bal">0</b> pts</span>
+    <span class="balwrap">bal <b id="bal">—</b> pts</span>
     <button class="getpts" id="getpts" hidden>+1000 FREE</button>
+    <button class="getpts" id="connect">CONNECT</button>
+  </div>
+
+  <div id="netbanner" class="histbar" hidden style="color:var(--bad);cursor:pointer">
+    wrong network — tap to switch to Injective
   </div>
 
   <div class="histbar"><span>last:</span><span id="hist"></span></div>
+
+  <div class="histbar" style="padding-top:0">
+    <button class="getpts" id="lpToggle" title="deposit to back bets and earn the vig">▸ BE THE HOUSE</button>
+  </div>
+  <div id="lp" class="histbar" hidden style="flex-wrap:wrap;gap:8px 12px;border-top:2px solid var(--bevel-dk);padding:8px">
+    <span>bankroll <b id="lpBank" style="color:var(--ink)">—</b></span>
+    <span>your LP <b id="lpMine" style="color:var(--ink)">—</b> pts</span>
+    <span>in play <b id="lpUtil" style="color:var(--ink)">—</b></span>
+    <span style="flex-basis:100%;height:0"></span>
+    <input id="lpAmt" type="number" min="0" step="1" placeholder="points" inputmode="decimal"
+      style="width:84px;font-family:var(--mono);padding:4px 6px;background:var(--panel-2);color:var(--ink);border:2px solid var(--bevel-dk)">
+    <button class="getpts" id="lpDep">DEPOSIT</button>
+    <button class="getpts" id="lpWd">WITHDRAW</button>
+    <span id="lpMsg" style="color:var(--ink-dim)">LPs are the counterparty — you win when bettors lose, earn the vig.</span>
+  </div>
 
   <div class="status">
     <span class="led" id="led"></span>
@@ -159,10 +179,11 @@
 </div>
 
 <div class="foot">
-  Tap the <b>green zone</b> if the price ends <b>above</b> the line, the <b>red zone</b> if below. Winners split the pot.<br>
+  Tap the <b>green zone</b> if the price ends <b>above</b> the line, the <b>red zone</b> if below. Win at fixed odds vs the house.<br>
   Fake points. Real prices (Pyth). Real adrenaline. On-chain version <span class="blink">under construction</span> 🚧
 </div>
 
+<script src="chain.js"></script>
 <script src="game.js"></script>
 </body>
 </html>

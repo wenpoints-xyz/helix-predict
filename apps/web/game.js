@@ -1,6 +1,7 @@
-/* PREDICT.EXE — $HELIXPOINT price arcade (POC).
-   Zero dependencies. Real prices via Pyth Hermes SSE; pools, bots and points are
-   simulated locally. The on-chain parimutuel contract replaces sim.* later. */
+/* PREDICT.EXE — $HELIXPOINT price arcade.
+   Zero dependencies. Live prices via Pyth Hermes SSE; rounds/pools/points/bets are ON-CHAIN
+   through PredictionPool (see chain.js -> window.PX). Bound to the 30s market per asset.
+   All timing is wall-clock (Date.now()) so the contract's lockTime/expiryTime line up with the chart. */
 (function () {
   "use strict";
 
@@ -10,8 +11,8 @@
     ETH: { id: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace", label: "ETH/USD" },
     INJ: { id: "7a5bc1d2b56ad029048cd63964b3ad2776eadf812edc1a43a31406cb54bff592", label: "INJ/USD" }
   };
-  var HIST_MS = 60000, PLAY_MS = 30000, BET_MS = 12000;
-  var RAKE = 0.03;
+  var HIST_MS = 60000, PLAY_MS = 30000;
+  var TF = 30, POLL_MS = 1200, EXPO = -8; // BTC/ETH/INJ Pyth feeds are expo -8
   var CHIPS_MAX_CAP = 1000;
 
   /* ---------- state ---------- */
@@ -19,38 +20,30 @@
   var S = {
     asset: "BTC",
     stake: parseInt(localStorage.predict_stake || "25", 10) || 25,
-    bal: parseInt(localStorage.predict_bal || "1000", 10),
+    bal: null, acct: null, board: [], seen: {},
     muted: localStorage.predict_mute === "1",
-    feeds: {},   // per asset: {samples:[{t,p}], disp, lastTick}
-    rounds: {},  // per asset: {n, phase, tEnd, strike, pools:{up,down}, lockMult:{up,down}, my:{up,down}, winEnd}
-    hist: {},    // per asset: [{dir, mine, delta}]
+    feeds: {}, rounds: {}, hist: {},
     hover: null, press: null, flash: null,
     feedMode: "live", lastAnyTick: 0
   };
-  assets.forEach(function (a) {
-    S.feeds[a] = { samples: [], disp: null, lastTick: 0 };
-    S.rounds[a] = null;
-    S.hist[a] = [];
-  });
+  assets.forEach(function (a) { S.feeds[a] = { samples: [], disp: null, lastTick: 0 }; S.rounds[a] = null; S.hist[a] = []; });
 
   /* ---------- dom ---------- */
   var $ = function (id) { return document.getElementById(id); };
   var cv = $("cv"), ctx = cv.getContext("2d");
   var wrap = $("chartwrap");
   var el = { rid: $("rid"), phase: $("phase"), clock: $("clock"), bal: $("bal"), hist: $("hist"),
-             led: $("led"), px: $("px"), feedlbl: $("feedlbl"), getpts: $("getpts") };
+             led: $("led"), px: $("px"), feedlbl: $("feedlbl"), getpts: $("getpts"),
+             connect: $("connect"), netbanner: $("netbanner"),
+             lp: $("lp"), lpToggle: $("lpToggle"), lpBank: $("lpBank"), lpMine: $("lpMine"),
+             lpUtil: $("lpUtil"), lpAmt: $("lpAmt"), lpDep: $("lpDep"), lpWd: $("lpWd"), lpMsg: $("lpMsg") };
 
   /* ---------- theme + palette ---------- */
   var PAL = {};
   function readPalette() {
     var cs = getComputedStyle(document.documentElement);
-    ["ink", "ink-dim", "accent", "accent-2", "ok", "bad", "panel-2", "bevel-dk"].forEach(function (k) {
-      PAL[k] = cs.getPropertyValue("--" + k).trim();
-    });
+    ["ink", "ink-dim", "accent", "accent-2", "ok", "bad", "panel-2", "bevel-dk"].forEach(function (k) { PAL[k] = cs.getPropertyValue("--" + k).trim(); });
   }
-  // canvas-safe comic stack: no system-ui/-apple-system idents (they can break
-  // ctx.font parsing, which silently reverts to the 10px default). On phones the
-  // comic fonts are absent and this lands on bold sans (Roboto on Android).
   var COMIC_CANVAS = "'Comic Sans MS','Comic Sans','Chalkboard SE','Comic Neue',sans-serif";
   document.documentElement.dataset.theme = localStorage.predict_theme || "dark";
   readPalette();
@@ -59,7 +52,7 @@
     document.documentElement.dataset.theme = t; localStorage.predict_theme = t; readPalette();
   };
 
-  /* ---------- audio (muted-able, lazy) ---------- */
+  /* ---------- audio ---------- */
   var AC = null;
   function beep(f, ms, type, g) {
     if (S.muted) return;
@@ -69,19 +62,17 @@
       o.type = type || "square"; o.frequency.value = f;
       gn.gain.setValueAtTime(g || 0.04, AC.currentTime);
       gn.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + ms / 1000);
-      o.connect(gn); gn.connect(AC.destination);
-      o.start(); o.stop(AC.currentTime + ms / 1000);
-    } catch (e) { /* no audio, no problem */ }
+      o.connect(gn); gn.connect(AC.destination); o.start(); o.stop(AC.currentTime + ms / 1000);
+    } catch (e) {}
   }
   function updateMuteBtn() { $("mutebtn").textContent = S.muted ? "×" : "♪"; }
   $("mutebtn").onclick = function () { S.muted = !S.muted; localStorage.predict_mute = S.muted ? "1" : "0"; updateMuteBtn(); };
   updateMuteBtn();
 
-  /* ---------- price feed: Pyth Hermes SSE, synthetic fallback ---------- */
+  /* ---------- price feed: Pyth Hermes SSE (wall-clock samples) ---------- */
   var es = null, retryMs = 1000;
   var ID2ASSET = {};
   assets.forEach(function (a) { ID2ASSET[FEEDS[a].id.toLowerCase()] = a; });
-
   function connectFeed() {
     var url = "https://hermes.pyth.network/v2/updates/price/stream?parsed=true";
     assets.forEach(function (a) { url += "&ids[]=" + FEEDS[a].id; });
@@ -92,155 +83,270 @@
         var a = ID2ASSET[(u.id || "").replace(/^0x/, "").toLowerCase()];
         if (!a || !u.price) return;
         var p = Number(u.price.price) * Math.pow(10, u.price.expo);
-        if (!(p > 0)) return;
-        pushSample(a, p);
+        if (p > 0) pushSample(a, p);
       });
-      retryMs = 1000; S.feedMode = "live"; S.lastAnyTick = performance.now();
+      retryMs = 1000; S.feedMode = "live"; S.lastAnyTick = Date.now();
     };
     es.onerror = function () { try { es.close(); } catch (e) {} scheduleRetry(); };
   }
   function scheduleRetry() { setTimeout(connectFeed, retryMs); retryMs = Math.min(retryMs * 2, 15000); }
-
   function pushSample(a, p) {
-    var f = S.feeds[a], t = performance.now();
-    f.samples.push({ t: t, p: p });
-    f.lastTick = t;
+    var f = S.feeds[a], t = Date.now();
+    f.samples.push({ t: t, p: p }); f.lastTick = t;
     var cutoff = t - (HIST_MS + PLAY_MS + 30000);
     while (f.samples.length && f.samples[0].t < cutoff) f.samples.shift();
     if (f.disp === null) f.disp = p;
   }
-
-  // synthetic random-walk keeps the demo alive if the stream drops
   function syntheticTick(now, dt) {
     if (S.feedMode === "live" && now - S.lastAnyTick < 8000) return;
     S.feedMode = "sim";
     assets.forEach(function (a) {
       var f = S.feeds[a];
       var last = f.samples.length ? f.samples[f.samples.length - 1].p : { BTC: 67000, ETH: 3500, INJ: 25 }[a];
-      if (!f._accum) f._accum = 0;
-      f._accum += dt;
-      if (f._accum > 400) {
-        f._accum = 0;
-        pushSample(a, last * (1 + (Math.random() - 0.5) * 0.0008));
-      }
+      f._accum = (f._accum || 0) + dt;
+      if (f._accum > 400) { f._accum = 0; pushSample(a, last * (1 + (Math.random() - 0.5) * 0.0008)); }
     });
   }
 
-  /* ---------- round engine (per asset) ---------- */
-  function newRound(a, now) {
-    var n = (S.rounds[a] ? S.rounds[a].n : parseInt(localStorage["predict_n_" + a] || "0", 10)) + 1;
-    localStorage["predict_n_" + a] = n;
-    S.rounds[a] = {
-      n: n, phase: "bet", tEnd: now + BET_MS, strike: null,
-      pools: { up: 60 + Math.random() * 180, down: 60 + Math.random() * 180 },
-      lockMult: null, my: { up: 0, down: 0 }, _lastTickSec: null
+  /* =========================================================================
+     ON-CHAIN round binding: poll boardSnapshot -> S.rounds; myPositions -> my/claim
+     ========================================================================= */
+  function marketFor(asset) {
+    var fid = FEEDS[asset].id.toLowerCase();
+    for (var i = 0; i < S.board.length; i++) {
+      var m = S.board[i];
+      if (m.feedId.replace(/^0x/, "").toLowerCase() === fid && m.timeframe === TF) return m;
+    }
+    return null;
+  }
+  // House: fixed odds. The payout multiplier is the round's payoutBps (same for both sides),
+  // known from creation, so it doesn't drift with the crowd like parimutuel did.
+  function mult(r) { return PX.payout(r.payoutBps); }
+  function mapRound(m) {
+    if (!m || !m.hasRound) return null;
+    var nowS = Date.now() / 1000;
+    var betting = m.state === 0 && nowS < m.lockTime;
+    var strike = m.state >= 1 ? Number(m.strike) * Math.pow(10, EXPO) : null;
+    var pm = PX.payout(m.payoutBps);
+    var r = {
+      n: m.roundId, roundId: m.roundId, state: m.state, upWon: m.upWon, voided: m.voided,
+      phase: betting ? "bet" : "play",
+      tEnd: (betting ? m.lockTime : m.expiryTime) * 1000,
+      strike: strike, payoutBps: m.payoutBps,
+      pools: { up: PX.toChips(m.upPool), down: PX.toChips(m.downPool) },
+      my: { up: 0, down: 0 }, claimable: 0, claimed: false
     };
+    r.lockMult = { up: pm, down: pm };
+    return r;
   }
-
-  function mult(r, side) {
-    var pot = r.pools.up + r.pools.down, pool = r.pools[side];
-    if (pool <= 0) return 0;
-    return pot * (1 - RAKE) / pool;
+  function poll() {
+    if (!PX.NET.live) return;
+    PX.boardSnapshot().then(function (board) {
+      S.board = board;
+      var ids = [];
+      assets.forEach(function (a) { var m = marketFor(a); if (m && m.hasRound) ids.push(m.roundId); });
+      var posP = (S.acct && ids.length) ? PX.myPositions(S.acct, ids).catch(function () { return []; }) : Promise.resolve([]);
+      return posP.then(function (positions) {
+        var by = {}; positions.forEach(function (p) { by[p.id] = p; });
+        assets.forEach(function (a) {
+          var m = marketFor(a), r = mapRound(m);
+          if (r) {
+            var p = by[r.roundId];
+            if (p) { r.my.up = PX.toChips(p.up); r.my.down = PX.toChips(p.down); r.claimable = PX.toChips(p.claimable); r.claimed = p.claimed; }
+          }
+          if (m && m.hasRound && m.state === 2 && !S.seen[m.roundId]) recordResult(a, m, by[m.roundId]);
+          S.rounds[a] = r;
+        });
+      });
+    }).catch(function () {}).then(function () { if (S.acct) refreshBalance(); refreshLp(); });
   }
-
-  function stepRound(a, now) {
-    var f = S.feeds[a];
-    if (!f.samples.length) return;            // wait for first price
-    if (!S.rounds[a]) newRound(a, now);
-    var r = S.rounds[a];
-
-    if (r.phase === "bet") {
-      // countdown ticks (active asset only)
-      if (a === S.asset) {
-        var remS = Math.ceil((r.tEnd - now) / 1000);
-        if (remS <= 3 && remS >= 1 && r._lastTickSec !== remS) { r._lastTickSec = remS; beep(800, 30); }
-      }
-      botBets(r, f, now);
-      if (now >= r.tEnd) {                    // LOCK: freeze strike + odds
-        r.phase = "play";
-        r.strike = f.disp || f.samples[f.samples.length - 1].p;
-        r.lockT = now; r.tEnd = now + PLAY_MS;
-        r.lockMult = { up: mult(r, "up"), down: mult(r, "down") };
-        if (a === S.asset) beep(210, 50, "square", 0.05);
-      }
-    } else if (r.phase === "play" && now >= r.tEnd) {
-      settle(a, r, f, now);
-    }
-  }
-
-  function settle(a, r, f, now) {
-    var P = f.samples[f.samples.length - 1].p;
-    var dir = Math.abs(P - r.strike) < r.strike * 1e-6 ? "tie" : (P > r.strike ? "up" : "down");
+  function recordResult(a, m, pos) {
+    S.seen[m.roundId] = true;
+    var up = pos ? PX.toChips(pos.up) : 0, down = pos ? PX.toChips(pos.down) : 0;
+    var claimable = pos ? PX.toChips(pos.claimable) : 0, claimed = pos ? pos.claimed : false;
+    var dir = m.voided ? "tie" : (m.upWon ? "up" : "down");
     var mine = null, delta = 0;
-    var stakeTotal = r.my.up + r.my.down;
-
-    if (dir === "tie") {
-      delta = stakeTotal;                                    // refund
-      if (stakeTotal > 0) mine = "tie";
-    } else if (stakeTotal > 0) {
-      var winStake = r.my[dir];
-      if (winStake > 0) {
-        var pot = r.pools.up + r.pools.down;
-        delta = Math.floor(winStake / r.pools[dir] * pot * (1 - RAKE));
-        mine = "win";
-      } else mine = "lose";
-    }
-    if (delta > 0) { S.bal += delta; saveBal(); }
-
-    S.hist[a].unshift({ dir: dir, mine: mine, delta: delta });
+    if (m.voided) { if (up + down > 0) { mine = "tie"; delta = up + down; } }
+    else { var ws = m.upWon ? up : down; if (ws > 0) { mine = "win"; delta = claimable; } else if (up + down > 0) mine = "lose"; }
+    S.hist[a].unshift({ dir: dir, mine: mine, delta: Math.floor(delta) });
     S.hist[a] = S.hist[a].slice(0, 16);
-
+    if ((mine === "win" || mine === "tie") && claimable > 0 && !claimed) claimRound(m.roundId);
     if (a === S.asset) {
-      S.flash = { t0: now, dir: dir, mine: mine };
-      if (mine === "win") { beep(660, 90); setTimeout(function () { beep(990, 140); }, 90); flyPoints("+" + delta, PAL.ok, dir); }
+      S.flash = { t0: Date.now(), dir: dir, mine: mine };
+      if (mine === "win") { beep(660, 90); setTimeout(function () { beep(990, 140); }, 90); flyPoints("+" + Math.floor(delta), PAL.ok, dir); }
       else if (mine === "lose") { beep(120, 180, "sawtooth", 0.05); flyPoints("rekt", PAL.bad, dir); }
       else if (mine === "tie") { flyPoints("push · refund", PAL["ink-dim"], "up"); }
-      renderHist(); updateBalance();
+      renderHist();
     }
-    newRound(a, now);
+  }
+  function claimRound(id) {
+    if (!S.acct) return;
+    PX.claim(PX.wallet.provider, S.acct, id).then(function () { setTimeout(poll, 2500); }).catch(function () {});
+  }
+  function refreshBalance() {
+    if (!S.acct) { S.bal = null; updateBalance(); return; }
+    PX.balanceOf(S.acct).then(function (w) { S.bal = PX.toChips(w); updateBalance(); }).catch(function () {});
   }
 
-  /* ---------- simulated co-bettors ---------- */
-  function botBets(r, f, now) {
-    if (!r._bot) r._bot = 0;
-    r._bot += 16;
-    if (r._bot < 250) return;
-    r._bot = 0;
-    if (Math.random() > 0.55) return;
-    // momentum bias from ~8s of movement
-    var s = f.samples, pNow = s[s.length - 1].p, pOld = pNow;
-    for (var i = s.length - 1; i >= 0; i--) { if (now - s[i].t > 8000) { pOld = s[i].p; break; } }
-    var chg = (pNow - pOld) / pOld;
-    var pUp = 0.5 + Math.max(-0.13, Math.min(0.13, chg * 900));
-    var side = Math.random() < pUp ? "up" : "down";
-    r.pools[side] += Math.floor(5 + Math.pow(Math.random(), 2) * 170);
+  /* ---------- wallet ---------- */
+  function short(a) { return a.slice(0, 6) + "…" + a.slice(-4); }
+  function refreshConnectBtn() {
+    el.connect.textContent = S.acct ? short(S.acct) : "CONNECT";
+    el.connect.title = S.acct ? "disconnect" : "connect wallet";
+  }
+  function openWallet() {
+    var list = PX.wallet.list();
+    if (!list.length) { toast("No EVM wallet found — install MetaMask, Rabby or Keplr."); return; }
+    if (list.length === 1) { doConnect(list[0].provider); return; }
+    showPicker(list);
+  }
+  function doConnect(provider) { PX.wallet.connect(provider).catch(function (e) { toast(e && e.code === 4001 ? "Connection cancelled." : "Could not connect."); }); }
+  function showPicker(list) {
+    var ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(6,11,22,.8);display:flex;align-items:center;justify-content:center;z-index:9998;padding:16px";
+    var box = document.createElement("div");
+    box.style.cssText = "background:var(--panel);border:3px solid;border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt);padding:14px;min-width:220px;max-width:92vw";
+    box.innerHTML = "<div style='font-family:var(--comic);font-weight:bold;color:var(--accent-2);margin-bottom:8px'>Pick a wallet</div>";
+    list.forEach(function (w) {
+      var b = document.createElement("button");
+      b.className = "getpts"; b.style.cssText = "display:block;width:100%;text-align:left;margin:4px 0";
+      b.textContent = w.name;
+      b.onclick = function () { document.body.removeChild(ov); doConnect(w.provider); };
+      box.appendChild(b);
+    });
+    ov.appendChild(box);
+    ov.onclick = function (e) { if (e.target === ov) document.body.removeChild(ov); };
+    document.body.appendChild(ov);
+  }
+  el.connect.onclick = function () { if (S.acct) PX.wallet.disconnect(); else openWallet(); };
+  function checkNet() {
+    // .histbar sets display, which overrides the [hidden] attr — so toggle display directly.
+    if (!S.acct) { el.netbanner.style.display = "none"; return; }
+    PX.wallet.currentChain().then(function (cid) { el.netbanner.style.display = (cid === PX.NET.chainIdHex) ? "none" : "block"; });
+  }
+  el.netbanner.onclick = function () { if (PX.wallet.provider) PX.wallet.ensureNetwork(PX.wallet.provider).then(checkNet); };
+  PX.wallet.onChange(function (w) {
+    S.acct = w.account; refreshConnectBtn(); checkNet();
+    if (S.acct) { poll(); } else { S.bal = null; updateBalance(); }
+  });
+
+  /* ---------- toast ---------- */
+  var toastEl = null, toastT = null;
+  function toast(msg) {
+    if (!toastEl) {
+      toastEl = document.createElement("div");
+      toastEl.style.cssText = "position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:var(--panel-2);color:var(--ink);border:2px solid var(--accent);padding:8px 14px;font-size:13px;z-index:9997;max-width:92vw;text-align:center";
+      document.body.appendChild(toastEl);
+    }
+    toastEl.textContent = msg; toastEl.style.display = "block";
+    clearTimeout(toastT); toastT = setTimeout(function () { toastEl.style.display = "none"; }, 3200);
   }
 
-  /* ---------- betting ---------- */
-  function stakeValue() {
-    if (S.stake === "max") return Math.max(0, Math.min(S.bal, CHIPS_MAX_CAP));
-    return S.stake;
-  }
+  /* ---------- betting (on-chain) ---------- */
+  function stakeValue() { return S.stake === "max" ? Math.max(0, Math.min(S.bal || 0, CHIPS_MAX_CAP)) : S.stake; }
   function placeBet(side) {
+    if (!S.acct) { openWallet(); return; }
     var r = S.rounds[S.asset];
-    if (!r || r.phase !== "bet") { beep(160, 40, "sawtooth"); return; }
-    var v = stakeValue();
-    if (v <= 0 || S.bal < v) { el.getpts.hidden = false; beep(160, 60, "sawtooth"); return; }
-    S.bal -= v; saveBal();
-    r.pools[side] += v; r.my[side] += v;
+    if (!r || r.phase !== "bet" || Date.now() >= r.tEnd) { beep(160, 40, "sawtooth"); return; }
+    var chips = stakeValue();
+    if (chips <= 0) { beep(160, 60, "sawtooth"); return; }
+    if (S.bal != null && S.bal < chips) { el.getpts.hidden = false; beep(160, 60, "sawtooth"); toast("Not enough points — hit the faucet."); return; }
+    var amt = PX.chipsToWei(chips), prov = PX.wallet.provider, from = S.acct, rid = r.roundId, up = side === "up";
     beep(600, 30); if (navigator.vibrate) navigator.vibrate(12);
-    updateBalance();
+    ensureAllowance(from, amt)
+      .then(function () { return PX.bet(prov, from, rid, up, amt); })
+      .then(function () { flyPoints("bet " + chips, PAL.accent, side); setTimeout(poll, 1500); })
+      .catch(function (e) { toast(e && e.code === 4001 ? "Bet cancelled." : "Bet failed."); });
   }
-  function saveBal() { localStorage.predict_bal = S.bal; }
+  function ensureAllowance(from, amt) {
+    return PX.allowance(from, PX.NET.pool).then(function (a) {
+      if (a >= amt) return;
+      toast("One-time approve — confirm in wallet.");
+      return PX.approve(PX.wallet.provider, from, PX.NET.pool, (1n << 256n) - 1n).then(function () { return waitAllowance(from, amt); });
+    });
+  }
+  function waitAllowance(from, amt) {
+    return new Promise(function (res, rej) {
+      var tries = 0;
+      (function loop() {
+        PX.allowance(from, PX.NET.pool).then(function (a) {
+          if (a >= amt) return res();
+          if (++tries > 40) return rej(new Error("approve timeout"));
+          setTimeout(loop, 1500);
+        }).catch(function () { setTimeout(loop, 1500); });
+      })();
+    });
+  }
   function updateBalance() {
-    el.bal.textContent = S.bal.toLocaleString("en-US");
-    el.getpts.hidden = S.bal >= 10;
+    el.bal.textContent = S.bal == null ? "—" : Math.floor(S.bal).toLocaleString("en-US");
+    el.getpts.hidden = !(S.acct && S.bal != null && S.bal < 10);
   }
   el.getpts.onclick = function () {
-    S.bal += 1000; saveBal(); updateBalance();
-    var loans = (parseInt(localStorage.predict_bailouts || "0", 10) + 1);
-    localStorage.predict_bailouts = loans;
-    flyPoints("+1000 (loan #" + loans + ")", PAL.ok, "up");
+    if (!S.acct) { openWallet(); return; }
+    toast("Minting test points — confirm in wallet.");
+    PX.faucet(PX.wallet.provider, S.acct, PX.chipsToWei(1000))
+      .then(function () { flyPoints("+1000", PAL.ok, "up"); setTimeout(poll, 2500); })
+      .catch(function (e) { toast(e && e.code === 4001 ? "Cancelled." : "Faucet failed."); });
+  };
+
+  /* ---------- LP vault: "be the house" ---------- */
+  var lpShown = false;
+  el.lpToggle.onclick = function () {
+    lpShown = !lpShown;
+    el.lp.hidden = !lpShown;
+    el.lpToggle.textContent = (lpShown ? "▾" : "▸") + " BE THE HOUSE";
+    if (lpShown) refreshLp();
+  };
+  function refreshLp() {
+    if (!PX.NET.live || !lpShown) return;
+    PX.houseStats().then(function (s) {
+      el.lpBank.textContent = Math.floor(PX.toChips(s.bankroll)).toLocaleString("en-US");
+      var util = s.bankroll > 0n ? Number(s.reserved * 10000n / s.bankroll) / 100 : 0;
+      el.lpUtil.textContent = util.toFixed(1) + "%";
+      if (S.acct) {
+        PX.vaultShares(S.acct).then(function (sh) {
+          var assets = sh * s.sharePrice / (10n ** 18n); // shares -> points at current price
+          el.lpMine.textContent = Math.floor(PX.toChips(assets)).toLocaleString("en-US");
+        }).catch(function () {});
+      } else { el.lpMine.textContent = "—"; }
+    }).catch(function () {});
+  }
+  function ensureVaultAllowance(from, amt) {
+    return PX.allowance(from, PX.NET.vault).then(function (a) {
+      if (a >= amt) return;
+      el.lpMsg.textContent = "One-time approve — confirm in wallet.";
+      return PX.approve(PX.wallet.provider, from, PX.NET.vault, (1n << 256n) - 1n).then(function () { return waitAllowanceVault(from, amt); });
+    });
+  }
+  function waitAllowanceVault(from, amt) {
+    return new Promise(function (res, rej) {
+      var tries = 0, iv = setInterval(function () {
+        PX.allowance(from, PX.NET.vault).then(function (a) {
+          if (a >= amt) { clearInterval(iv); res(); }
+          else if (++tries > 40) { clearInterval(iv); rej(new Error("approve timeout")); }
+        });
+      }, 800);
+    });
+  }
+  el.lpDep.onclick = function () {
+    if (!S.acct) { openWallet(); return; }
+    var chips = parseFloat(el.lpAmt.value); if (!(chips > 0)) { el.lpMsg.textContent = "Enter an amount."; return; }
+    var amt = PX.chipsToWei(chips), from = S.acct;
+    if (S.bal != null && S.bal < chips) { el.lpMsg.textContent = "Not enough points — hit the faucet."; return; }
+    el.lpMsg.textContent = "Depositing to the house…";
+    ensureVaultAllowance(from, amt)
+      .then(function () { return PX.vaultDeposit(PX.wallet.provider, from, amt); })
+      .then(function () { el.lpMsg.textContent = "Deposited. You're backing bets now."; el.lpAmt.value = ""; setTimeout(function () { refreshLp(); refreshBalance(); }, 2500); })
+      .catch(function (e) { el.lpMsg.textContent = e && e.code === 4001 ? "Cancelled." : "Deposit failed."; });
+  };
+  el.lpWd.onclick = function () {
+    if (!S.acct) { openWallet(); return; }
+    var chips = parseFloat(el.lpAmt.value); if (!(chips > 0)) { el.lpMsg.textContent = "Enter an amount."; return; }
+    var from = S.acct;
+    el.lpMsg.textContent = "Withdrawing…";
+    PX.vaultWithdraw(PX.wallet.provider, from, PX.chipsToWei(chips))
+      .then(function () { el.lpMsg.textContent = "Withdrawn (only free, unreserved capital)."; el.lpAmt.value = ""; setTimeout(function () { refreshLp(); refreshBalance(); }, 2500); })
+      .catch(function (e) { el.lpMsg.textContent = e && e.code === 4001 ? "Cancelled." : "Withdraw failed (capital may be backing open bets)."; });
   };
 
   /* ---------- flying points ---------- */
@@ -258,12 +364,9 @@
   /* ---------- canvas ---------- */
   var W = 0, H = 0, DPR = 1;
   function resize() {
-    var w = wrap.clientWidth;
-    var h = Math.max(240, Math.min(Math.round(window.innerHeight * 0.42), 400));
+    var w = wrap.clientWidth, h = Math.max(240, Math.min(Math.round(window.innerHeight * 0.42), 400));
     DPR = window.devicePixelRatio || 1;
-    cv.width = Math.round(w * DPR); cv.height = Math.round(h * DPR);
-    cv.style.height = h + "px";
-    W = w; H = h;
+    cv.width = Math.round(w * DPR); cv.height = Math.round(h * DPR); cv.style.height = h + "px"; W = w; H = h;
   }
   window.addEventListener("resize", resize);
 
@@ -272,31 +375,24 @@
     var f = S.feeds[S.asset], r = S.rounds[S.asset];
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.clearRect(0, 0, W, H);
-    var splitX = Math.round(W * (HIST_MS / (HIST_MS + PLAY_MS)));    // 2/3
+    var splitX = Math.round(W * (HIST_MS / (HIST_MS + PLAY_MS)));
 
     if (!f.samples.length) {
       ctx.fillStyle = PAL["ink-dim"]; ctx.font = "bold 14px 'Courier New',monospace"; ctx.textAlign = "center";
       ctx.fillText("dialing up the price feed…", W / 2, H / 2);
       return;
     }
-
-    // eased display price
     var last = f.samples[f.samples.length - 1].p;
     f.disp += (last - f.disp) * 0.18;
 
-    // time window: rolling while betting, pinned to expiry while playing
-    var t1 = (r && r.phase === "play") ? r.tEnd : now + PLAY_MS;
+    var playing = r && r.phase === "play";
+    var t1 = playing ? r.tEnd : now + PLAY_MS;
     var t0 = t1 - (HIST_MS + PLAY_MS);
     var xOf = function (t) { return (t - t0) / (t1 - t0) * W; };
 
-    // y-scale targets: visible samples + strike, padded
     var lo = Infinity, hi = -Infinity;
-    for (var i = 0; i < f.samples.length; i++) {
-      var sm = f.samples[i];
-      if (sm.t < t0) continue;
-      if (sm.p < lo) lo = sm.p; if (sm.p > hi) hi = sm.p;
-    }
-    var strike = r ? (r.phase === "play" ? r.strike : f.disp) : f.disp;
+    for (var i = 0; i < f.samples.length; i++) { var sm = f.samples[i]; if (sm.t < t0) continue; if (sm.p < lo) lo = sm.p; if (sm.p > hi) hi = sm.p; }
+    var strike = r && r.strike ? r.strike : f.disp;
     if (strike < lo) lo = strike; if (strike > hi) hi = strike;
     var pad = Math.max((hi - lo) * 0.35, strike * 0.0004);
     var tMin = lo - pad, tMax = hi + pad;
@@ -305,135 +401,87 @@
     var yOf = function (p) { return H - (p - yScale.min) / (yScale.max - yScale.min) * H; };
     var strikeY = Math.max(26, Math.min(H - 26, yOf(strike)));
 
-    /* future zone tiles */
     var betting = r && r.phase === "bet";
-    var zones = [
-      { side: "up", y0: 0, y1: strikeY, col: PAL.ok },
-      { side: "down", y0: strikeY, y1: H, col: PAL.bad }
-    ];
+    var zones = [{ side: "up", y0: 0, y1: strikeY, col: PAL.ok }, { side: "down", y0: strikeY, y1: H, col: PAL.bad }];
     zones.forEach(function (z) {
       var alpha = 0.10;
       if (betting && S.hover === z.side) alpha = 0.17;
       if (betting && S.press === z.side) alpha = 0.26;
       if (r && r.my[z.side] > 0) alpha += 0.05;
-      ctx.globalAlpha = alpha;
-      ctx.fillStyle = z.col;
-      ctx.fillRect(splitX, z.y0, W - splitX, z.y1 - z.y0);
-      ctx.globalAlpha = 1;
+      ctx.globalAlpha = alpha; ctx.fillStyle = z.col; ctx.fillRect(splitX, z.y0, W - splitX, z.y1 - z.y0); ctx.globalAlpha = 1;
     });
-
-    // settle flash overlay
     if (S.flash && now - S.flash.t0 < 650 && S.flash.dir !== "tie") {
       var k = 1 - (now - S.flash.t0) / 650;
-      ctx.globalAlpha = 0.35 * k;
-      ctx.fillStyle = S.flash.dir === "up" ? PAL.ok : PAL.bad;
+      ctx.globalAlpha = 0.35 * k; ctx.fillStyle = S.flash.dir === "up" ? PAL.ok : PAL.bad;
       var zy = S.flash.dir === "up" ? [0, strikeY] : [strikeY, H];
-      ctx.fillRect(splitX, zy[0], W - splitX, zy[1] - zy[0]);
-      ctx.globalAlpha = 1;
+      ctx.fillRect(splitX, zy[0], W - splitX, zy[1] - zy[0]); ctx.globalAlpha = 1;
     }
 
-    /* grid */
     ctx.strokeStyle = PAL["ink-dim"]; ctx.globalAlpha = 0.18; ctx.lineWidth = 1;
     ctx.font = "10px 'Courier New',monospace"; ctx.textAlign = "left";
-    for (var g = 1; g <= 3; g++) {
-      var gy = H * g / 4;
-      ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke();
-    }
+    for (var g = 1; g <= 3; g++) { var gy = H * g / 4; ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke(); }
     ctx.globalAlpha = 0.55; ctx.fillStyle = PAL["ink-dim"];
-    for (g = 1; g <= 3; g++) {
-      var gp = yScale.max - (yScale.max - yScale.min) * g / 4;
-      ctx.fillText(fmt(gp), 4, H * g / 4 - 3);
-    }
+    for (g = 1; g <= 3; g++) { var gp = yScale.max - (yScale.max - yScale.min) * g / 4; ctx.fillText(fmt(gp), 4, H * g / 4 - 3); }
     ctx.globalAlpha = 1;
 
-    /* split line */
-    ctx.strokeStyle = PAL["ink-dim"]; ctx.globalAlpha = 0.4;
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath(); ctx.moveTo(splitX, 0); ctx.lineTo(splitX, H); ctx.stroke();
-    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    ctx.strokeStyle = PAL["ink-dim"]; ctx.globalAlpha = 0.4; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(splitX, 0); ctx.lineTo(splitX, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
 
-    /* strike line */
     ctx.strokeStyle = PAL.accent; ctx.lineWidth = betting ? 1.5 : 2;
     if (betting) ctx.setLineDash([6, 4]);
-    ctx.beginPath(); ctx.moveTo(0, strikeY); ctx.lineTo(W, strikeY); ctx.stroke();
-    ctx.setLineDash([]);
-    // strike tag
+    ctx.beginPath(); ctx.moveTo(0, strikeY); ctx.lineTo(W, strikeY); ctx.stroke(); ctx.setLineDash([]);
     var tag = "@ " + fmt(strike);
     ctx.font = "bold 11px 'Courier New',monospace";
     var tw = ctx.measureText(tag).width + 10;
-    ctx.fillStyle = PAL.accent;
-    ctx.fillRect(splitX - tw - 4, strikeY - 9, tw, 18);
-    ctx.fillStyle = "#fff"; ctx.textAlign = "center";
-    ctx.fillText(tag, splitX - tw / 2 - 4, strikeY + 4);
+    ctx.fillStyle = PAL.accent; ctx.fillRect(splitX - tw - 4, strikeY - 9, tw, 18);
+    ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.fillText(tag, splitX - tw / 2 - 4, strikeY + 4);
 
-    /* price polyline */
-    ctx.strokeStyle = PAL["accent-2"]; ctx.lineWidth = 2;
-    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.strokeStyle = PAL["accent-2"]; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
     ctx.beginPath();
     var started = false;
     for (i = 0; i < f.samples.length; i++) {
-      sm = f.samples[i];
-      if (sm.t < t0 - 1000) continue;
+      sm = f.samples[i]; if (sm.t < t0 - 1000) continue;
       var px = xOf(sm.t), py = yOf(sm.p);
       if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
     }
     var headX = xOf(now), headY = yOf(f.disp);
     if (started) ctx.lineTo(headX, headY);
     ctx.stroke();
-
-    // head glow
     ctx.fillStyle = PAL["accent-2"];
     ctx.globalAlpha = 0.25; ctx.beginPath(); ctx.arc(headX, headY, 7, 0, 7); ctx.fill();
     ctx.globalAlpha = 1; ctx.beginPath(); ctx.arc(headX, headY, 3, 0, 7); ctx.fill();
 
-    /* zone labels */
     if (r) {
       var zx = splitX + (W - splitX) / 2;
       zones.forEach(function (z) {
         var mid = (z.y0 + z.y1) / 2;
-        var m = r.phase === "play" ? r.lockMult[z.side] : mult(r, z.side);
-        ctx.fillStyle = z.col;
-        ctx.font = "bold 13px " + COMIC_CANVAS;
-        // arrow drawn as a real triangle — ▲/▼ glyphs render as colored emoji
-        // on Android and can't be styled or trusted in canvas
+        var m = r.lockMult[z.side]; // fixed odds: same before and after lock
+        ctx.fillStyle = z.col; ctx.font = "bold 13px " + COMIC_CANVAS;
         var label = z.side === "up" ? "UP" : "DOWN";
         var lw = ctx.measureText(label).width;
-        ctx.textAlign = "left";
-        ctx.fillText(label, zx - lw / 2 + 6, mid - 22);
+        ctx.textAlign = "left"; ctx.fillText(label, zx - lw / 2 + 6, mid - 22);
         var tx = zx - lw / 2 - 5, ty = mid - 26;
         ctx.beginPath();
         if (z.side === "up") { ctx.moveTo(tx - 6, ty + 4); ctx.lineTo(tx + 6, ty + 4); ctx.lineTo(tx, ty - 5); }
         else { ctx.moveTo(tx - 6, ty - 5); ctx.lineTo(tx + 6, ty - 5); ctx.lineTo(tx, ty + 4); }
         ctx.closePath(); ctx.fill();
-        ctx.textAlign = "center";
-        ctx.font = "bold 24px 'Courier New',monospace";
+        ctx.textAlign = "center"; ctx.font = "bold 24px 'Courier New',monospace";
         ctx.fillText("×" + m.toFixed(2), zx, mid + 2);
-        ctx.font = "11px 'Courier New',monospace";
-        ctx.fillStyle = PAL.ink;
+        ctx.font = "11px 'Courier New',monospace"; ctx.fillStyle = PAL.ink;
         var v = stakeValue();
         if (betting && v > 0) ctx.fillText("win " + Math.floor(v * m) + " pts", zx, mid + 18);
-        if (r.my[z.side] > 0) {
-          ctx.fillStyle = z.col;
-          ctx.fillText("YOU: " + r.my[z.side], zx, mid + 32);
-        }
-        ctx.fillStyle = PAL["ink-dim"];
-        ctx.fillText("pool " + Math.floor(r.pools[z.side]), zx, z.y1 - 6 < mid + 40 ? z.y0 + 12 : z.y1 - 6);
+        if (r.my[z.side] > 0) { ctx.fillStyle = z.col; ctx.fillText("YOU: " + Math.floor(r.my[z.side]), zx, mid + 32); }
+        ctx.fillStyle = PAL["ink-dim"]; ctx.fillText("bets " + Math.floor(r.pools[z.side]), zx, z.y1 - 6 < mid + 40 ? z.y0 + 12 : z.y1 - 6);
       });
-
-      // zone header
       ctx.font = "bold 10px 'Courier New',monospace"; ctx.textAlign = "center";
       ctx.fillStyle = betting ? PAL.ok : PAL.bad;
       ctx.fillText(betting ? ">> BETS OPEN <<" : "LOCKED - SWEAT", splitX + (W - splitX) / 2, 12);
     }
-
-    /* expiry flag while playing */
-    if (r && r.phase === "play") {
+    if (playing) {
       ctx.strokeStyle = PAL.ink; ctx.globalAlpha = 0.5; ctx.setLineDash([2, 3]);
-      ctx.beginPath(); ctx.moveTo(W - 1, 0); ctx.lineTo(W - 1, H); ctx.stroke();
-      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.moveTo(W - 1, 0); ctx.lineTo(W - 1, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
     }
   }
-
   function fmt(p) {
     if (p >= 10000) return p.toLocaleString("en-US", { maximumFractionDigits: 0 });
     if (p >= 100) return p.toFixed(1);
@@ -447,22 +495,15 @@
     if (x < splitX) return null;
     var f = S.feeds[S.asset], r = S.rounds[S.asset];
     if (!r || !f.samples.length) return null;
-    var strike = r.phase === "play" ? r.strike : f.disp;
+    var strike = r.strike ? r.strike : f.disp;
     var strikeY = Math.max(26, Math.min(H - 26, H - (strike - yScale.min) / (yScale.max - yScale.min) * H));
     return y < strikeY ? "up" : "down";
   }
-  function evPos(e) {
-    var rct = cv.getBoundingClientRect();
-    return { x: e.clientX - rct.left, y: e.clientY - rct.top };
-  }
-  cv.addEventListener("pointerdown", function (e) {
-    var p = evPos(e), z = zoneAt(p.x, p.y);
-    if (z) { S.press = z; placeBet(z); }
-  });
+  function evPos(e) { var rct = cv.getBoundingClientRect(); return { x: e.clientX - rct.left, y: e.clientY - rct.top }; }
+  cv.addEventListener("pointerdown", function (e) { var p = evPos(e), z = zoneAt(p.x, p.y); if (z) { S.press = z; placeBet(z); } });
   cv.addEventListener("pointerup", function () { S.press = null; });
   cv.addEventListener("pointermove", function (e) {
-    var p = evPos(e), z = zoneAt(p.x, p.y);
-    S.hover = z;
+    var p = evPos(e), z = zoneAt(p.x, p.y); S.hover = z;
     cv.style.cursor = z && S.rounds[S.asset] && S.rounds[S.asset].phase === "bet" ? "pointer" : "default";
   });
   cv.addEventListener("pointerleave", function () { S.hover = null; S.press = null; });
@@ -470,8 +511,7 @@
   /* ---------- tabs + chips ---------- */
   $("tabs").addEventListener("click", function (e) {
     var b = e.target.closest(".tab"); if (!b) return;
-    S.asset = b.dataset.asset;
-    yScale.init = false;
+    S.asset = b.dataset.asset; yScale.init = false;
     document.querySelectorAll(".tab").forEach(function (t) { t.setAttribute("aria-pressed", t === b ? "true" : "false"); });
     renderHist();
   });
@@ -494,7 +534,6 @@
     h.slice(0, 14).forEach(function (x) {
       var s = document.createElement("span");
       s.className = "hdot " + x.dir + (x.mine ? " mine" : "");
-      // ︎ forces text presentation — Android otherwise renders these as emoji
       s.textContent = x.dir === "up" ? "▲︎" : x.dir === "down" ? "▼︎" : "•";
       s.title = x.mine ? (x.mine + (x.delta ? " +" + x.delta : "")) : x.dir;
       el.hist.appendChild(s);
@@ -507,12 +546,16 @@
     if (!f.samples.length) {
       el.phase.textContent = S.feedMode === "sim" ? "SIM FEED — WARMING UP" : "CONNECTING…";
       el.phase.className = "phase"; el.clock.textContent = "0:00"; el.rid.textContent = "ROUND #—";
-    } else if (r) {
-      var rem = Math.max(0, r.tEnd - now), s = Math.ceil(rem / 1000);
+    } else if (!r) {
+      el.phase.textContent = PX.NET.live ? "WAITING FOR ROUND" : "MAINNET SOON";
+      el.phase.className = "phase"; el.clock.textContent = "0:00"; el.rid.textContent = "ROUND #—";
+    } else {
+      var s = Math.ceil(Math.max(0, r.tEnd - now) / 1000);
       el.clock.textContent = Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
       el.rid.textContent = "ROUND #" + r.n;
-      if (r.phase === "bet") { el.phase.textContent = "PLACE YOUR BETS"; el.phase.className = "phase hot"; }
-      else { el.phase.textContent = "LOCKED @ " + fmt(r.strike); el.phase.className = "phase locked"; }
+      if (r.phase === "bet" && now < r.tEnd) { el.phase.textContent = "PLACE YOUR BETS"; el.phase.className = "phase hot"; }
+      else if (r.state === 2) { el.phase.textContent = r.voided ? "VOID — REFUND" : (r.upWon ? "UP WINS" : "DOWN WINS"); el.phase.className = "phase locked"; }
+      else { el.phase.textContent = r.strike ? "LOCKED @ " + fmt(r.strike) : "LOCKING…"; el.phase.className = "phase locked"; }
     }
     var fresh = now - f.lastTick < 5000;
     el.led.className = "led" + ((fresh || S.feedMode === "sim") ? " on" : "");
@@ -521,20 +564,33 @@
   }
 
   /* ---------- main loop ---------- */
-  var lastFrame = performance.now();
-  function frame(now) {
-    var dt = now - lastFrame; lastFrame = now;
+  var lastFrame = Date.now();
+  function frame() {
+    var now = Date.now(), dt = now - lastFrame; lastFrame = now;
     syntheticTick(now, dt);
-    assets.forEach(function (a) { stepRound(a, now); });
     draw(now);
     updateHud(now);
     requestAnimationFrame(frame);
   }
 
+  /* ---------- mainnet gate ---------- */
+  function showComingSoon() {
+    var d = document.createElement("div");
+    d.style.cssText = "position:fixed;inset:0;background:rgba(6,11,22,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;text-align:center;padding:24px;color:var(--ink)";
+    d.innerHTML = "<div style='font-family:var(--comic);font-size:22px;color:var(--accent);margin-bottom:10px'>PREDICT.EXE — mainnet coming soon</div>" +
+      "<div style='max-width:420px;line-height:1.5'>Live on <b>testnet</b> for now. Play with free points at " +
+      "<a style='color:var(--accent-2)' href='https://predict.test.wenpoints.xyz/'>predict.test.wenpoints.xyz</a>.</div>";
+    document.body.appendChild(d);
+  }
+
   /* ---------- boot ---------- */
   resize();
+  refreshConnectBtn();
+  el.netbanner.style.display = "none";
   updateBalance();
   renderHist();
   connectFeed();
+  if (PX.NET.live) { PX.wallet.restore(); poll(); setInterval(poll, POLL_MS); }
+  else { showComingSoon(); }
   requestAnimationFrame(frame);
 })();
