@@ -47,9 +47,11 @@
     ["ink", "ink-dim", "accent", "accent-2", "ok", "bad", "panel-2", "bevel-dk"].forEach(function (k) {
       PAL[k] = cs.getPropertyValue("--" + k).trim();
     });
-    PAL.comic = cs.getPropertyValue("--comic").trim() || "'Comic Sans MS',cursive";
   }
-  window.matchMedia("(max-width: 480px)").addEventListener("change", readPalette);
+  // canvas-safe comic stack: no system-ui/-apple-system idents (they can break
+  // ctx.font parsing, which silently reverts to the 10px default). On phones the
+  // comic fonts are absent and this lands on bold sans (Roboto on Android).
+  var COMIC_CANVAS = "'Comic Sans MS','Comic Sans','Chalkboard SE','Comic Neue',sans-serif";
   document.documentElement.dataset.theme = localStorage.predict_theme || "dark";
   readPalette();
   $("themebtn").onclick = function () {
@@ -390,11 +392,20 @@
       zones.forEach(function (z) {
         var mid = (z.y0 + z.y1) / 2;
         var m = r.phase === "play" ? r.lockMult[z.side] : mult(r, z.side);
-        var arrow = z.side === "up" ? "▲ UP" : "▼ DOWN";
-        ctx.textAlign = "center";
         ctx.fillStyle = z.col;
-        ctx.font = "bold 13px " + PAL.comic;
-        ctx.fillText(arrow, zx, mid - 22);
+        ctx.font = "bold 13px " + COMIC_CANVAS;
+        // arrow drawn as a real triangle — ▲/▼ glyphs render as colored emoji
+        // on Android and can't be styled or trusted in canvas
+        var label = z.side === "up" ? "UP" : "DOWN";
+        var lw = ctx.measureText(label).width;
+        ctx.textAlign = "left";
+        ctx.fillText(label, zx - lw / 2 + 6, mid - 22);
+        var tx = zx - lw / 2 - 5, ty = mid - 26;
+        ctx.beginPath();
+        if (z.side === "up") { ctx.moveTo(tx - 6, ty + 4); ctx.lineTo(tx + 6, ty + 4); ctx.lineTo(tx, ty - 5); }
+        else { ctx.moveTo(tx - 6, ty - 5); ctx.lineTo(tx + 6, ty - 5); ctx.lineTo(tx, ty + 4); }
+        ctx.closePath(); ctx.fill();
+        ctx.textAlign = "center";
         ctx.font = "bold 24px 'Courier New',monospace";
         ctx.fillText("×" + m.toFixed(2), zx, mid + 2);
         ctx.font = "11px 'Courier New',monospace";
@@ -412,7 +423,7 @@
       // zone header
       ctx.font = "bold 10px 'Courier New',monospace"; ctx.textAlign = "center";
       ctx.fillStyle = betting ? PAL.ok : PAL.bad;
-      ctx.fillText(betting ? "◄ BETS OPEN ►" : "LOCKED — SWEAT", splitX + (W - splitX) / 2, 12);
+      ctx.fillText(betting ? ">> BETS OPEN <<" : "LOCKED - SWEAT", splitX + (W - splitX) / 2, 12);
     }
 
     /* expiry flag while playing */
@@ -483,7 +494,8 @@
     h.slice(0, 14).forEach(function (x) {
       var s = document.createElement("span");
       s.className = "hdot " + x.dir + (x.mine ? " mine" : "");
-      s.textContent = x.dir === "up" ? "▲" : x.dir === "down" ? "▼" : "•";
+      // ︎ forces text presentation — Android otherwise renders these as emoji
+      s.textContent = x.dir === "up" ? "▲︎" : x.dir === "down" ? "▼︎" : "•";
       s.title = x.mine ? (x.mine + (x.delta ? " +" + x.delta : "")) : x.dir;
       el.hist.appendChild(s);
     });
