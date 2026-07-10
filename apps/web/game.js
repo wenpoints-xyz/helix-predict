@@ -567,6 +567,22 @@
       var fx = Math.min(xOf(r.tEnd), W - 1);
       ctx.strokeStyle = PAL.ink; ctx.globalAlpha = 0.5; ctx.setLineDash([2, 3]);
       ctx.beginPath(); ctx.moveTo(fx, 0); ctx.lineTo(fx, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+      // the round settles on the first Pyth tick published AT/AFTER expiry, not at the line
+      // itself — ring that tick so the "price decided after the line" moment is visible
+      if (now >= r.tEnd) {
+        var endSec = r.tEnd / 1000;
+        for (var si = 0; si < f.samples.length; si++) {
+          var sp = f.samples[si];
+          if (sp.pt && sp.pt >= endSec) {
+            var mx = xOf(sp.t), my = yOf(sp.p);
+            ctx.strokeStyle = sp.p > strike ? PAL.ok : sp.p < strike ? PAL.bad : PAL.ink;
+            ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(mx, my, 6, 0, 7); ctx.stroke();
+            ctx.font = "bold 9px 'Courier New',monospace"; ctx.textAlign = "center";
+            ctx.fillStyle = PAL["ink-dim"]; ctx.fillText("settle tick", mx, my - 10);
+            break;
+          }
+        }
+      }
     }
   }
   function fmt(p) {
@@ -645,6 +661,7 @@
       if (r.phase === "roll") { el.phase.textContent = now - r.rollSince > 10000 ? "NO BETS — WAITING FOR NEXT ROUND" : "NO BETS — NEXT ROUND SOON"; el.phase.className = "phase"; }
       else if (r.phase === "bet" && now < r.tEnd) { el.phase.textContent = "PLACE YOUR BETS"; el.phase.className = "phase hot"; }
       else if (r.state === 2) { el.phase.textContent = r.voided ? "VOID — REFUND" : (r.upWon ? "UP WINS" : "DOWN WINS"); el.phase.className = "phase locked"; }
+      else if (r.phase === "play" && now >= r.tEnd) { el.phase.textContent = "SETTLING…"; el.phase.className = "phase locked"; }
       else { var sk = strikeFor(r, f); el.phase.textContent = (sk.status === "locked" ? "LOCKED @ " : "LOCKING @ ~") + fmt(sk.p); el.phase.className = "phase locked"; }
     }
     var fresh = now - f.lastTick < 5000;
@@ -680,7 +697,22 @@
   updateBalance();
   renderHist();
   connectFeed();
-  if (PX.NET.live) { PX.wallet.restore(); poll(); setInterval(poll, POLL_MS); }
+  // Adaptive poll cadence: idle rounds tick at POLL_MS, but near a lock/expiry boundary or
+  // while a round awaits its on-chain settle, poll fast — the perceived "lag" at the finish
+  // line is mostly waiting a full poll period to notice the keeper's tx already landed.
+  function nextPollDelay() {
+    var now = Date.now(), fast = false;
+    assets.forEach(function (a) {
+      var r = S.rounds[a];
+      if (!r) return;
+      if (Math.abs(now - r.lockTime) < 2500 || Math.abs(now - r.tEnd) < 2500) fast = true;
+      if (r.phase === "play" && now >= r.tEnd) fast = true;   // awaiting settle
+      if (r.phase === "roll") fast = true;                    // awaiting next round
+    });
+    return fast ? 300 : POLL_MS;
+  }
+  function pollLoop() { poll(); setTimeout(pollLoop, nextPollDelay()); }
+  if (PX.NET.live) { PX.wallet.restore(); pollLoop(); }
   else { showComingSoon(); }
   requestAnimationFrame(frame);
 })();
