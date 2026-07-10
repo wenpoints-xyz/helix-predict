@@ -11,7 +11,10 @@
     ETH: { id: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace", label: "ETH/USD" },
     INJ: { id: "7a5bc1d2b56ad029048cd63964b3ad2776eadf812edc1a43a31406cb54bff592", label: "INJ/USD" }
   };
-  var HIST_MS = 60000, PLAY_MS = 30000;
+  // Chart window = history:future at 3:1, both derived from the round's ON-CHAIN timeframe —
+  // hardcoding these to 60s/30s while rounds are 15s made the head jump right at lock and
+  // run off-frame while waiting for the keeper's settle.
+  var SPLIT = 0.75; // 3:1 ratio → the bet/future divider is always at 75% of the width
   var TF = 15, POLL_MS = 1200, EXPO = -8; // BTC/ETH/INJ Pyth feeds are expo -8; markets are 15s
   var CHIPS_MAX_CAP = 1000;
 
@@ -105,7 +108,7 @@
     }
     f.samples.push({ t: t, p: p, sim: !!sim }); f.lastTick = t;
     if (sim) f._hasSim = true;
-    var cutoff = t - (HIST_MS + PLAY_MS + 30000);
+    var cutoff = t - 120000; // covers the widest window (4×timeframe) plus settle-wait slack
     while (f.samples.length && f.samples[0].t < cutoff) f.samples.shift();
     if (f.disp === null) f.disp = p;
   }
@@ -145,6 +148,7 @@
       n: m.roundId, roundId: m.roundId, state: m.state, upWon: m.upWon, voided: m.voided,
       phase: betting ? "bet" : "play",
       lockTime: m.lockTime * 1000,
+      tfMs: m.timeframe * 1000,
       tEnd: (betting ? m.lockTime : m.expiryTime) * 1000,
       strike: strike, payoutBps: m.payoutBps,
       pools: { up: PX.toChips(m.upPool), down: PX.toChips(m.downPool) },
@@ -420,7 +424,7 @@
     var f = S.feeds[S.asset], r = S.rounds[S.asset];
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.clearRect(0, 0, W, H);
-    var splitX = Math.round(W * (HIST_MS / (HIST_MS + PLAY_MS)));
+    var splitX = Math.round(W * SPLIT);
 
     if (!f.samples.length) {
       ctx.fillStyle = PAL["ink-dim"]; ctx.font = "bold 14px 'Courier New',monospace"; ctx.textAlign = "center";
@@ -435,11 +439,13 @@
     else f.disp += (last - f.disp) * 0.18;
 
     var playing = r && r.phase === "play";
-    // During play, pin the right edge to expiry — but once expiry passes (waiting a few seconds for
-    // the keeper's on-chain settle), follow `now` so the live price stays on screen instead of
-    // running off the right edge. Capped so a stalled settle can't scroll the chart into oblivion.
-    var t1 = playing ? Math.min(Math.max(r.tEnd, now), r.tEnd + 20000) : now + PLAY_MS;
-    var t0 = t1 - (HIST_MS + PLAY_MS);
+    // Future span = the round's real timeframe (15s markets), history = 3× that. During play the
+    // right edge pins to expiry so the head glides from the split to the finish; once expiry
+    // passes (waiting on the keeper's settle) the window follows `now`, keeping the head pinned
+    // at the right edge — no cap, the finish-line marker scrolls left with history instead.
+    var futMs = (r && r.tfMs) || TF * 1000, histMs = 3 * futMs;
+    var t1 = playing ? Math.max(r.tEnd, now) : now + futMs;
+    var t0 = t1 - (histMs + futMs);
     var xOf = function (t) { return (t - t0) / (t1 - t0) * W; };
 
     var lo = Infinity, hi = -Infinity;
@@ -539,8 +545,11 @@
       ctx.fillText(betting ? ">> BETS OPEN <<" : "LOCKED - SWEAT", splitX + (W - splitX) / 2, 12);
     }
     if (playing) {
+      // finish line at the round's actual expiry — stays put at the right edge until expiry,
+      // then scrolls left with history while the head waits at the live edge for settlement
+      var fx = Math.min(xOf(r.tEnd), W - 1);
       ctx.strokeStyle = PAL.ink; ctx.globalAlpha = 0.5; ctx.setLineDash([2, 3]);
-      ctx.beginPath(); ctx.moveTo(W - 1, 0); ctx.lineTo(W - 1, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.moveTo(fx, 0); ctx.lineTo(fx, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
     }
   }
   function fmt(p) {
@@ -552,7 +561,7 @@
 
   /* ---------- input ---------- */
   function zoneAt(x, y) {
-    var splitX = W * (HIST_MS / (HIST_MS + PLAY_MS));
+    var splitX = W * SPLIT;
     if (x < splitX) return null;
     var f = S.feeds[S.asset], r = S.rounds[S.asset];
     if (!r || !f.samples.length) return null;
