@@ -1,29 +1,34 @@
-// Keeper for PredictionHouse.
+// Keeper for PredictionHouse — BLOCK-DRIVEN.
 //
-// Per market it maintains one round through its lifecycle:
+// Subscribes to new blocks over WSS and fires the moment a round becomes eligible (first block whose
+// timestamp >= lockTime / expiryTime), instead of waiting on a slow poll. Reads + tx sends go over
+// HTTP (reliable); the socket is only a fast trigger. If the socket drops it reconnects, and a
+// fallback interval keeps ticking so the keeper never stalls.
 //
-//   (none/Settled) --createRound--> [Open] --lock(Pyth)--> [Locked] --settle(Pyth)--> [Settled] -> ...
-//                                      │  \                     │
-//                                      │   \ no bets at lockTime -> roll to next slot, NO Pyth fee
-//                             expiry+grace lapsed ─── voidExpired ──► refund (funds never lock)
+//   new block ──► tick ──► per market:
+//     (none/Settled) --createRound--> [Open] --lock(Pyth)--> [Locked] --settle(Pyth)--> [Settled] -> ...
+//                                        │  \                     │
+//                                        │   \ no bets at lockTime -> roll to next slot, NO Pyth fee
+//                               expiry+grace lapsed ─── voidExpired ──► refund (funds never lock)
 //
-// Idle cost: an empty round (nobody bet the house) never pays a Pyth fee — it's orphaned (0 stake,
-// 0 reserve) and the market rolls forward. Only rounds with real bets get locked+settled on-chain.
+// Idle cost: an empty round (nobody bet) never pays a Pyth fee — it's orphaned (0 stake, 0 reserve)
+// and the market rolls forward. Only rounds with real bets get locked+settled on-chain. Injective
+// gives no receipt, so we never await tx.wait(); a per-market cooldown dedupes sends across blocks.
 //
-// It reads the whole board in one call (boardSnapshot), pulls signed price updates from Hermes for
-// lock/settle, and pays the Pyth fee (excess is refunded on-chain). Injective returns null receipts,
-// so it never waits on tx.wait(); it manages the nonce locally and verifies effects via the next read.
-//
-// Env: RPC_URL, HOUSE_ADDR, KEEPER_PRIVATE_KEY or KEEPER_MNEMONIC, [HERMES_URL, LEAD_SEC, POLL_MS, GAS_LIMIT]
+// Env: RPC_URL, WSS_URL, HOUSE_ADDR, KEEPER_PRIVATE_KEY|KEEPER_MNEMONIC,
+//      [HERMES_URL, LEAD_SEC, FALLBACK_MS, ACTION_COOLDOWN, GAS_LIMIT]
 // Flags: --once (single tick then exit)
 
 import { ethers } from "ethers";
+import WebSocket from "ws";
 
 const RPC_URL = req("RPC_URL");
+const WSS_URL = process.env.WSS_URL || "wss://k8s.testnet.ws.injective.network/";
 const HOUSE_ADDR = req("HOUSE_ADDR");
 const HERMES = (process.env.HERMES_URL || "https://hermes.pyth.network").replace(/\/$/, "");
-const LEAD = num("LEAD_SEC", 12); // seconds ahead to set a new round's lockTime
-const POLL_MS = num("POLL_MS", 4000);
+const LEAD = num("LEAD_SEC", 8); // seconds ahead to set a new round's lockTime
+const FALLBACK_MS = num("FALLBACK_MS", 6000); // tick this often even if the socket is quiet/down
+const ACTION_COOLDOWN = num("ACTION_COOLDOWN", 4); // don't re-act on a market within this many seconds
 const GAS_LIMIT = BigInt(process.env.GAS_LIMIT || "2500000");
 const ONCE = process.argv.includes("--once");
 
@@ -37,14 +42,15 @@ const HOUSE_ABI = [
   "function voidExpired(uint256 roundId)"
 ];
 const PYTH_ABI = ["function getUpdateFee(bytes[] updateData) view returns (uint256)"];
-
 const State = { Open: 0, Locked: 1, Settled: 2 };
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = makeWallet();
 const house = new ethers.Contract(HOUSE_ADDR, HOUSE_ABI, wallet);
 let pyth;
+let grace = 3600; // cached settleGrace; refreshed at startup
 
+// ---- nonce (never await receipts on Injective; manage locally) ----
 let localNonce = null;
 async function nextNonce() {
   if (localNonce === null) localNonce = await provider.getTransactionCount(wallet.address, "pending");
@@ -54,10 +60,19 @@ function resyncNonce() {
   localNonce = null;
 }
 
+// ---- per-market cooldown: don't re-send while the last tx is still in flight ----
+const actedAt = {};
+function recentlyActed(mid, now) {
+  return actedAt[mid] && now - actedAt[mid] < ACTION_COOLDOWN;
+}
+function markActed(mid) {
+  actedAt[mid] = Math.floor(Date.now() / 1000);
+}
+
 async function pythUpdate(feedId) {
   const id = feedId.startsWith("0x") ? feedId.slice(2) : feedId;
   const url = `${HERMES}/v2/updates/price/latest?ids[]=0x${id}&encoding=hex`;
-  const r = await fetch(url);
+  const r = await fetch(url, { signal: AbortSignal.timeout(3000) }); // never hang the loop on Hermes
   if (!r.ok) throw new Error(`hermes ${r.status}`);
   const j = await r.json();
   const data = j?.binary?.data;
@@ -71,17 +86,10 @@ async function send(label, fn) {
     const tx = await fn(nonce);
     log(`${label} sent nonce=${nonce} tx=${tx.hash}`);
   } catch (e) {
-    resyncNonce(); // nonce/estimate errors: resync next tick
+    resyncNonce();
     log(`${label} FAILED: ${short(e)}`);
   }
 }
-
-// Don't act on the same market twice before the last tx has a chance to mine (Injective gives no
-// receipt, so we can't await it). Cooldown is < LEAD, so it never blocks a legit next-phase action.
-const actedAt = {};
-const ACTION_COOLDOWN = num("ACTION_COOLDOWN", 9);
-function recentlyActed(mid, now) { return actedAt[mid] && now - actedAt[mid] < ACTION_COOLDOWN; }
-function markActed(mid) { actedAt[mid] = Math.floor(Date.now() / 1000); }
 
 // Open the next round. Cadence: while the chain is live open exactly the next slot (= this round's
 // expiry); after a settled/lapsed round restart genesis-style a short lead ahead.
@@ -92,41 +100,6 @@ function createNext(m, now) {
   return send(`createRound m${mid} @${target}`, (nonce) =>
     house.createRound(mid, target, { nonce, gasLimit: GAS_LIMIT })
   );
-}
-
-async function handleMarket(m, now, grace) {
-  if (!m.marketEnabled) return;
-  const mid = Number(m.marketId);
-  if (recentlyActed(mid, now)) return; // let the last tx land first
-  const st = Number(m.state);
-  const lockT = Number(m.lockTime);
-  const expT = Number(m.expiryTime);
-  const rid = m.roundId;
-  const hasBets = m.upPool > 0n || m.downPool > 0n;
-  const voidExp = () => send(`voidExpired r${rid}`, (n) => house.voidExpired(rid, { nonce: n, gasLimit: GAS_LIMIT }));
-
-  // no round yet, or the last real game settled -> open a fresh one
-  if (!m.hasRound || st === State.Settled) { markActed(mid); return createNext(m, now); }
-
-  if (st === State.Open) {
-    // EMPTY round: nobody bet the house, so NEVER spend a Pyth fee locking/settling it. Once
-    // betting has closed, roll the market to the next slot — the empty round is harmlessly
-    // orphaned (0 stake, 0 reserve, invisible to the board). This is the idle-cost optimization.
-    if (!hasBets) {
-      if (now >= lockT) { markActed(mid); return createNext(m, now); }
-      return; // still open for bets
-    }
-    // real game (someone bet vs the house) -> lock on Pyth
-    if (now >= expT + grace) { markActed(mid); return voidExp(); }
-    if (now >= lockT) { markActed(mid); return lockOrSettle("lock", rid, m.feedId); }
-    return; // still taking bets
-  }
-
-  if (st === State.Locked) {
-    if (now >= expT + grace) { markActed(mid); return voidExp(); }
-    if (now >= expT) { markActed(mid); return lockOrSettle("settle", rid, m.feedId); }
-    return; // waiting for expiry
-  }
 }
 
 async function lockOrSettle(kind, rid, feedId) {
@@ -142,37 +115,139 @@ async function lockOrSettle(kind, rid, feedId) {
   );
 }
 
-async function tick() {
-  const now = Math.floor(Date.now() / 1000);
-  const [board, grace] = await Promise.all([house.boardSnapshot(), house.settleGrace()]);
-  const g = Number(grace);
+async function handleMarket(m, now) {
+  if (!m.marketEnabled) return;
+  const mid = Number(m.marketId);
+  if (recentlyActed(mid, now)) return; // let the last tx land first
+  const st = Number(m.state);
+  const lockT = Number(m.lockTime);
+  const expT = Number(m.expiryTime);
+  const rid = m.roundId;
+  const hasBets = m.upPool > 0n || m.downPool > 0n;
+  const voidExp = () => send(`voidExpired r${rid}`, (n) => house.voidExpired(rid, { nonce: n, gasLimit: GAS_LIMIT }));
+
+  // no round yet, or the last real game settled -> open a fresh one
+  if (!m.hasRound || st === State.Settled) {
+    markActed(mid);
+    return createNext(m, now);
+  }
+
+  if (st === State.Open) {
+    // EMPTY round: never spend a Pyth fee on it. Once betting closes, roll to the next slot
+    // (the empty round is harmlessly orphaned: 0 stake, 0 reserve, off the board).
+    if (!hasBets) {
+      if (now >= lockT) {
+        markActed(mid);
+        return createNext(m, now);
+      }
+      return; // still open for bets
+    }
+    // real game (someone bet vs the house) -> lock on Pyth the first eligible block
+    if (now >= expT + grace) {
+      markActed(mid);
+      return voidExp();
+    }
+    if (now >= lockT) {
+      markActed(mid);
+      return lockOrSettle("lock", rid, m.feedId);
+    }
+    return; // still taking bets
+  }
+
+  if (st === State.Locked) {
+    if (now >= expT + grace) {
+      markActed(mid);
+      return voidExp();
+    }
+    if (now >= expT) {
+      markActed(mid);
+      return lockOrSettle("settle", rid, m.feedId);
+    }
+    return; // waiting for expiry
+  }
+}
+
+let reading = false;
+async function tick(blockTs) {
+  if (reading) return; // guard ONLY the fast board read
+  reading = true;
+  const now = blockTs || Math.floor(Date.now() / 1000);
+  let board;
+  try {
+    board = await house.boardSnapshot();
+  } catch (e) {
+    reading = false;
+    return log(`read error: ${short(e)}`);
+  }
+  reading = false;
+  // Fire per-market actions WITHOUT awaiting. handleMarket sets the per-market cooldown synchronously
+  // before any await, so a slow Hermes/broadcast on one market can never stall the next block's tick
+  // (that global-await stall is what pinned reactions to the fallback interval).
   for (const m of board) {
-    try {
-      await handleMarket(m, now, g);
-    } catch (e) {
+    handleMarket(m, now).catch((e) => {
       resyncNonce();
       log(`market ${m.marketId} error: ${short(e)}`);
-    }
+    });
   }
+}
+
+// ---- WSS block feed (fast trigger); self-reconnecting ----
+function startBlockFeed(onBlock) {
+  let alive = true, backoff = 1000, ws;
+  function connect() {
+    ws = new WebSocket(WSS_URL, { handshakeTimeout: 8000 });
+    ws.on("open", () => {
+      backoff = 1000;
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["newHeads"] }));
+      log("ws connected");
+    });
+    ws.on("message", (d) => {
+      let j;
+      try {
+        j = JSON.parse(d.toString());
+      } catch {
+        return;
+      }
+      const h = j?.method === "eth_subscription" ? j.params?.result : null;
+      if (h && h.number) onBlock(parseInt(h.number, 16), h.timestamp ? parseInt(h.timestamp, 16) : 0);
+    });
+    ws.on("close", () => reconnect("close"));
+    ws.on("error", (e) => reconnect("error " + short(e)));
+  }
+  function reconnect(why) {
+    if (!alive) return;
+    try {
+      ws.terminate();
+    } catch {}
+    log(`ws reconnect (${why}) in ${backoff}ms`);
+    setTimeout(() => alive && connect(), backoff);
+    backoff = Math.min(backoff * 2, 15000);
+  }
+  connect();
+  return () => {
+    alive = false;
+    try {
+      ws.close();
+    } catch {}
+  };
 }
 
 async function main() {
   pyth = new ethers.Contract(await house.pyth(), PYTH_ABI, provider);
-  log(`keeper up: house=${HOUSE_ADDR} signer=${wallet.address} hermes=${HERMES} lead=${LEAD}s poll=${POLL_MS}ms once=${ONCE}`);
+  grace = Number(await house.settleGrace());
+  log(`keeper up (block-driven): house=${HOUSE_ADDR} signer=${wallet.address} ws=${WSS_URL} lead=${LEAD}s grace=${grace}s once=${ONCE}`);
+
   if (ONCE) {
     await tick();
     return;
   }
-  let running = false;
-  for (;;) {
-    if (!running) {
-      running = true;
-      tick()
-        .catch((e) => log(`tick error: ${short(e)}`))
-        .finally(() => (running = false));
-    }
-    await sleep(POLL_MS);
-  }
+  let lastBlock = 0;
+  startBlockFeed((num, ts) => {
+    if (num <= lastBlock) return; // ignore dupes/reorgs going backwards
+    lastBlock = num;
+    tick(ts);
+  });
+  setInterval(() => tick(), FALLBACK_MS); // belt-and-suspenders if the socket is quiet/down
 }
 
 // ---- helpers ----
@@ -196,9 +271,6 @@ function short(e) {
 }
 function log(...a) {
   console.log(new Date().toISOString(), ...a);
-}
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 main().catch((e) => {
