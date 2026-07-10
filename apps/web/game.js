@@ -467,7 +467,7 @@
 
     var lo = Infinity, hi = -Infinity;
     for (var i = 0; i < f.samples.length; i++) { var sm = f.samples[i]; if (sm.t < t0) continue; if (sm.p < lo) lo = sm.p; if (sm.p > hi) hi = sm.p; }
-    var strike = strikeFor(r, f).p;
+    var sk = strikeFor(r, f), strike = sk.p;
     if (strike < lo) lo = strike; if (strike > hi) hi = strike;
     var pad = Math.max((hi - lo) * 0.35, strike * 0.0004);
     var tMin = lo - pad, tMax = hi + pad;
@@ -526,6 +526,23 @@
     ctx.fillStyle = PAL["accent-2"];
     ctx.globalAlpha = 0.25; ctx.beginPath(); ctx.arc(headX, headY, 7, 0, 7); ctx.fill();
     ctx.globalAlpha = 1; ctx.beginPath(); ctx.arc(headX, headY, 3, 0, 7); ctx.fill();
+
+    // Live price riding the dot during a locked round: price + ▲/▼, GREEN above the locked strike /
+    // RED below (the win/lose signal). Floats to the winning side away from the strike line, with a
+    // dark halo so it stays legible over the price line + tinted zones in both themes. Hidden once
+    // settled (the result overlay takes over) and during betting (no strike to compare).
+    if (r && playing && r.state !== 2 && sk.status !== "live") {
+      var live = f.disp;
+      var col = live > strike ? PAL.ok : live < strike ? PAL.bad : PAL["ink-dim"];
+      var arrow = live > strike ? "▲" : live < strike ? "▼" : "•";
+      var txt = arrow + " " + fmt(live);
+      var rx = Math.min(headX - 8, W - 4);
+      var ry = Math.max(16, Math.min(H - 6, live > strike ? headY - 12 : headY + 20));
+      ctx.font = "bold 13px 'Courier New',monospace"; ctx.textAlign = "right";
+      ctx.lineWidth = 3; ctx.lineJoin = "round"; ctx.strokeStyle = PAL["panel-2"];
+      ctx.strokeText(txt, rx, ry); // halo
+      ctx.fillStyle = col; ctx.fillText(txt, rx, ry);
+    }
 
     if (r && rolling) {
       // empty round rolled by the keeper: calm beat, no fake lock theater
