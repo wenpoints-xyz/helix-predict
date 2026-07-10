@@ -1,7 +1,8 @@
 name: Deploy web
 
-# Actions-native Pages deploy of the arcade UI (apps/web) — same pattern as
-# wenpoints.xyz: no gh-pages branch, no legacy Jekyll builder.
+# Production deploy of the arcade UI (apps/web) to Cloudflare Pages on push to main.
+# The custom domains predict.wenpoints.xyz + predict.test.wenpoints.xyz are attached to this
+# Pages project, so this keeps them current. (PRs get their own CF preview via web-pr-preview.yml.)
 on:
   push:
     branches: [main]
@@ -10,46 +11,14 @@ on:
       - ".github/workflows/web-deploy.yml"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - name: Deploy to Cloudflare Pages (production)
+        uses: cloudflare/wrangler-action@v3
         with:
-          path: apps/web
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.final.outputs.page_url || steps.try1.outputs.page_url || steps.try2.outputs.page_url }}
-    steps:
-      # Pages publish intermittently fails with "try again later" — retry 3x.
-      - id: try1
-        uses: actions/deploy-pages@v4
-        continue-on-error: true
-      - name: wait before retry 2
-        if: steps.try1.outcome == 'failure'
-        run: sleep 20
-      - id: try2
-        if: steps.try1.outcome == 'failure'
-        uses: actions/deploy-pages@v4
-        continue-on-error: true
-      - name: wait before retry 3
-        if: steps.try1.outcome == 'failure' && steps.try2.outcome == 'failure'
-        run: sleep 40
-      - id: final
-        if: steps.try1.outcome == 'failure' && steps.try2.outcome == 'failure'
-        uses: actions/deploy-pages@v4
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy apps/web --project-name=helix-predict --branch=main --commit-dirty=true
