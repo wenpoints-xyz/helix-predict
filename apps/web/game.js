@@ -225,9 +225,17 @@
     PX.wallet.currentChain().then(function (cid) { el.netbanner.style.display = (cid === PX.NET.chainIdHex) ? "none" : "block"; });
   }
   el.netbanner.onclick = function () { if (PX.wallet.provider) PX.wallet.ensureNetwork(PX.wallet.provider).then(checkNet); };
+  var gasWarnedFor = null;
+  function checkGas() {
+    if (!S.acct || S.acct === gasWarnedFor || !PX.NET.live) return;
+    gasWarnedFor = S.acct;
+    PX.nativeBalance(S.acct).then(function (w) {
+      if (w < 1000000000000000n) toast("Low on INJ gas — every tx needs a little INJ. Get it free at faucet.injective.network."); // < 0.001 INJ
+    }).catch(function () {});
+  }
   PX.wallet.onChange(function (w) {
     S.acct = w.account; refreshConnectBtn(); checkNet();
-    if (S.acct) { poll(); } else { S.bal = null; updateBalance(); }
+    if (S.acct) { poll(); checkGas(); } else { S.bal = null; updateBalance(); }
   });
 
   /* ---------- toast ---------- */
@@ -239,7 +247,16 @@
       document.body.appendChild(toastEl);
     }
     toastEl.textContent = msg; toastEl.style.display = "block";
-    clearTimeout(toastT); toastT = setTimeout(function () { toastEl.style.display = "none"; }, 3200);
+    clearTimeout(toastT); toastT = setTimeout(function () { toastEl.style.display = "none"; }, 4200);
+  }
+  // Turn a wallet/RPC error into a human message. Every tx (even the free points faucet) costs INJ
+  // gas, so a 0-INJ wallet fails at broadcast with "insufficient funds" — surface that clearly.
+  function txErr(e, fallback) {
+    if (e && e.code === 4001) return "Cancelled.";
+    var m = ((e && (e.message || (e.data && e.data.message) || (e.error && e.error.message))) || "").toLowerCase();
+    if (m.indexOf("insufficient funds") !== -1 || m.indexOf("sender balance") !== -1 || m.indexOf("gas required") !== -1)
+      return "No gas — you need testnet INJ. Get it free at faucet.injective.network, then retry.";
+    return fallback;
   }
 
   /* ---------- betting (on-chain) ---------- */
@@ -256,7 +273,7 @@
     ensureAllowance(from, amt)
       .then(function () { return PX.bet(prov, from, rid, up, amt); })
       .then(function () { flyPoints("bet " + chips, PAL.accent, side); setTimeout(poll, 1500); })
-      .catch(function (e) { toast(e && e.code === 4001 ? "Bet cancelled." : "Bet failed."); });
+      .catch(function (e) { toast(txErr(e, "Bet failed.")); });
   }
   function ensureAllowance(from, amt) {
     return PX.allowance(from, PX.NET.pool).then(function (a) {
@@ -286,7 +303,7 @@
     toast("Minting test points — confirm in wallet.");
     PX.faucet(PX.wallet.provider, S.acct, PX.chipsToWei(1000))
       .then(function () { flyPoints("+1000", PAL.ok, "up"); setTimeout(poll, 2500); })
-      .catch(function (e) { toast(e && e.code === 4001 ? "Cancelled." : "Faucet failed."); });
+      .catch(function (e) { toast(txErr(e, "Faucet failed.")); });
   };
 
   /* ---------- LP vault: "be the house" ---------- */
@@ -337,7 +354,7 @@
     ensureVaultAllowance(from, amt)
       .then(function () { return PX.vaultDeposit(PX.wallet.provider, from, amt); })
       .then(function () { el.lpMsg.textContent = "Deposited. You're backing bets now."; el.lpAmt.value = ""; setTimeout(function () { refreshLp(); refreshBalance(); }, 2500); })
-      .catch(function (e) { el.lpMsg.textContent = e && e.code === 4001 ? "Cancelled." : "Deposit failed."; });
+      .catch(function (e) { el.lpMsg.textContent = txErr(e, "Deposit failed."); });
   };
   el.lpWd.onclick = function () {
     if (!S.acct) { openWallet(); return; }
@@ -346,7 +363,7 @@
     el.lpMsg.textContent = "Withdrawing…";
     PX.vaultWithdraw(PX.wallet.provider, from, PX.chipsToWei(chips))
       .then(function () { el.lpMsg.textContent = "Withdrawn (only free, unreserved capital)."; el.lpAmt.value = ""; setTimeout(function () { refreshLp(); refreshBalance(); }, 2500); })
-      .catch(function (e) { el.lpMsg.textContent = e && e.code === 4001 ? "Cancelled." : "Withdraw failed (capital may be backing open bets)."; });
+      .catch(function (e) { el.lpMsg.textContent = txErr(e, "Withdraw failed (capital may be backing open bets)."); });
   };
 
   /* ---------- flying points ---------- */

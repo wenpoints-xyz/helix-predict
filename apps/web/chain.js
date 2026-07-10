@@ -129,6 +129,7 @@
     return ethCall(NET.pool, data).then(function (h) { return decodeMyPositions(h, ids); });
   }
   function balanceOf(a) { return ethCall(NET.points, SEL.balanceOf + addr32(a)).then(function (h) { return BigInt(h); }); }
+  function nativeBalance(a) { return rpc("eth_getBalance", [a, "latest"]).then(function (h) { return BigInt(h); }); } // INJ, for gas
   function allowance(o, s) { return ethCall(NET.points, SEL.allowance + addr32(o) + addr32(s)).then(function (h) { return BigInt(h); }); }
   // ---- house/vault reads ----
   function houseStats() { return ethCall(NET.pool, SEL.houseStats).then(decodeStats); }
@@ -250,7 +251,7 @@
   // ---- public API ----
   window.PX = {
     NET: NET,
-    boardSnapshot: boardSnapshot, myPositions: myPositions, balanceOf: balanceOf, allowance: allowance,
+    boardSnapshot: boardSnapshot, myPositions: myPositions, balanceOf: balanceOf, allowance: allowance, nativeBalance: nativeBalance,
     houseStats: houseStats, vaultShares: vaultShares, vaultMaxWithdraw: vaultMaxWithdraw,
     bet: bet, claim: claim, faucet: faucet, approve: approve,
     vaultDeposit: vaultDeposit, vaultWithdraw: vaultWithdraw,
