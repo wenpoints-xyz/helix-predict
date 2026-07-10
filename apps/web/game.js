@@ -428,7 +428,10 @@
     else f.disp += (last - f.disp) * 0.18;
 
     var playing = r && r.phase === "play";
-    var t1 = playing ? r.tEnd : now + PLAY_MS;
+    // During play, pin the right edge to expiry — but once expiry passes (waiting a few seconds for
+    // the keeper's on-chain settle), follow `now` so the live price stays on screen instead of
+    // running off the right edge. Capped so a stalled settle can't scroll the chart into oblivion.
+    var t1 = playing ? Math.min(Math.max(r.tEnd, now), r.tEnd + 20000) : now + PLAY_MS;
     var t0 = t1 - (HIST_MS + PLAY_MS);
     var xOf = function (t) { return (t - t0) / (t1 - t0) * W; };
 
