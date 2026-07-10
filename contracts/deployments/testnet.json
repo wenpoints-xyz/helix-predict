@@ -1,0 +1,16 @@
+{
+  "network": "injective-evm-testnet",
+  "chainId": 1439,
+  "rpc": "https://k8s.testnet.json-rpc.injective.network/",
+  "explorer": "https://testnet.blockscout.injective.network",
+  "deployedAt": "2026-07-09",
+  "deployer": "0x68D85663DaE6Aed5F102b7ec1f5551b890Ce1db3",
+  "contracts": {
+    "MockPoints": "0xB16DdF3Ba1ea11e19bf54e5c34C73A97F65d6AdF",
+    "PredictionPool": "0x45dB6aB51EF1C885ffF6e7bc76ff9221dC37a4f2",
+    "pyth": "0xDd24F84d36BF92C65F92307595335bdFab5Bbd21"
+  },
+  "config": { "rakeBps": 300, "maxPriceAge": 60 },
+  "markets": "BTC/ETH/INJ x 30s/60s/120s (9 total)",
+  "note": "v2 adds voidRound + boardSnapshot + myPositions views. Old pool 0x6C1b8C5a superseded."
+}

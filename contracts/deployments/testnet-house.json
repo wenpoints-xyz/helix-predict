@@ -1,0 +1,27 @@
+{
+  "network": "injective-evm-testnet",
+  "chainId": 1439,
+  "rpc": "https://k8s.testnet.json-rpc.injective.network/",
+  "explorer": "https://testnet.blockscout.injective.network",
+  "deployedAt": "2026-07-09",
+  "deployer": "0x68D85663DaE6Aed5F102b7ec1f5551b890Ce1db3",
+  "stack": "house",
+  "contracts": {
+    "MockPoints": "0x52045F671C452b7f91a7e436c64f126E78638F14",
+    "HouseVault": "0x15FC2a0020A2a8309E602fC7B148B120C9C3b587",
+    "PredictionHouse": "0xe7773Db880BF38574441699A60E53d68a52Db680",
+    "pyth": "0xDd24F84d36BF92C65F92307595335bdFab5Bbd21"
+  },
+  "config": {
+    "payoutBps": 19500,
+    "maxPriceAge": 60,
+    "maxRoundExposureBps": 1000,
+    "maxAggExposureBps": 3000,
+    "maxBet": "5000e18",
+    "maxConfBps": 200,
+    "settleGrace": 3600,
+    "seedBankroll": "100000e18"
+  },
+  "markets": "LIVE: BTC/ETH/INJ x 15s (ids 9-11, enabled). Original 30s/60s/120s (ids 0-8) disabled 2026-07-10.",
+  "note": "House model (LP vault is counterparty). Supersedes the parimutuel PredictionPool 0x45dB6aB5 for predict.test. Vault ERC4626 shares hHLX-t; vig accrues to share price."
+}
