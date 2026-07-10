@@ -3,8 +3,12 @@
 // Per market it maintains one round through its lifecycle:
 //
 //   (none/Settled) --createRound--> [Open] --lock(Pyth)--> [Locked] --settle(Pyth)--> [Settled] -> ...
-//                                      │                        │
+//                                      │  \                     │
+//                                      │   \ no bets at lockTime -> roll to next slot, NO Pyth fee
 //                             expiry+grace lapsed ─── voidExpired ──► refund (funds never lock)
+//
+// Idle cost: an empty round (nobody bet the house) never pays a Pyth fee — it's orphaned (0 stake,
+// 0 reserve) and the market rolls forward. Only rounds with real bets get locked+settled on-chain.
 //
 // It reads the whole board in one call (boardSnapshot), pulls signed price updates from Hermes for
 // lock/settle, and pays the Pyth fee (excess is refunded on-chain). Injective returns null receipts,
@@ -72,30 +76,55 @@ async function send(label, fn) {
   }
 }
 
+// Don't act on the same market twice before the last tx has a chance to mine (Injective gives no
+// receipt, so we can't await it). Cooldown is < LEAD, so it never blocks a legit next-phase action.
+const actedAt = {};
+const ACTION_COOLDOWN = num("ACTION_COOLDOWN", 9);
+function recentlyActed(mid, now) { return actedAt[mid] && now - actedAt[mid] < ACTION_COOLDOWN; }
+function markActed(mid) { actedAt[mid] = Math.floor(Date.now() / 1000); }
+
+// Open the next round. Cadence: while the chain is live open exactly the next slot (= this round's
+// expiry); after a settled/lapsed round restart genesis-style a short lead ahead.
+function createNext(m, now) {
+  const mid = Number(m.marketId);
+  const expT = Number(m.expiryTime);
+  const target = m.hasRound && expT > now ? expT : now + LEAD;
+  return send(`createRound m${mid} @${target}`, (nonce) =>
+    house.createRound(mid, target, { nonce, gasLimit: GAS_LIMIT })
+  );
+}
+
 async function handleMarket(m, now, grace) {
   if (!m.marketEnabled) return;
-  const mid = m.marketId;
+  const mid = Number(m.marketId);
+  if (recentlyActed(mid, now)) return; // let the last tx land first
   const st = Number(m.state);
   const lockT = Number(m.lockTime);
   const expT = Number(m.expiryTime);
   const rid = m.roundId;
+  const hasBets = m.upPool > 0n || m.downPool > 0n;
+  const voidExp = () => send(`voidExpired r${rid}`, (n) => house.voidExpired(rid, { nonce: n, gasLimit: GAS_LIMIT }));
 
-  // no round yet, or the latest one is done -> open the next
-  if (!m.hasRound || st === State.Settled) {
-    return send(`createRound m${mid}`, (nonce) =>
-      house.createRound(mid, now + LEAD, { nonce, gasLimit: GAS_LIMIT })
-    );
-  }
+  // no round yet, or the last real game settled -> open a fresh one
+  if (!m.hasRound || st === State.Settled) { markActed(mid); return createNext(m, now); }
 
   if (st === State.Open) {
-    if (now >= expT + grace) return send(`voidExpired r${rid}`, (n) => house.voidExpired(rid, { nonce: n, gasLimit: GAS_LIMIT }));
-    if (now >= lockT) return lockOrSettle("lock", rid, m.feedId);
+    // EMPTY round: nobody bet the house, so NEVER spend a Pyth fee locking/settling it. Once
+    // betting has closed, roll the market to the next slot — the empty round is harmlessly
+    // orphaned (0 stake, 0 reserve, invisible to the board). This is the idle-cost optimization.
+    if (!hasBets) {
+      if (now >= lockT) { markActed(mid); return createNext(m, now); }
+      return; // still open for bets
+    }
+    // real game (someone bet vs the house) -> lock on Pyth
+    if (now >= expT + grace) { markActed(mid); return voidExp(); }
+    if (now >= lockT) { markActed(mid); return lockOrSettle("lock", rid, m.feedId); }
     return; // still taking bets
   }
 
   if (st === State.Locked) {
-    if (now >= expT + grace) return send(`voidExpired r${rid}`, (n) => house.voidExpired(rid, { nonce: n, gasLimit: GAS_LIMIT }));
-    if (now >= expT) return lockOrSettle("settle", rid, m.feedId);
+    if (now >= expT + grace) { markActed(mid); return voidExp(); }
+    if (now >= expT) { markActed(mid); return lockOrSettle("settle", rid, m.feedId); }
     return; // waiting for expiry
   }
 }
