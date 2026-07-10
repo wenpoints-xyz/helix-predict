@@ -13,7 +13,7 @@ const FEEDS = {
   ETH: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
   INJ: "7a5bc1d2b56ad029048cd63964b3ad2776eadf812edc1a43a31406cb54bff592"
 };
-const MK = [["BTC", 30], ["BTC", 60], ["BTC", 120], ["ETH", 30], ["ETH", 60], ["ETH", 120], ["INJ", 30], ["INJ", 60], ["INJ", 120]];
+const MK = [["BTC", 15], ["ETH", 15], ["INJ", 15]]; // live markets are BTC/ETH/INJ at 15s
 const SEL = { board: "0x938be1ab", myPos: "0x98a973bb", balanceOf: "0x70a08231", allowance: "0xdd62ed3e", bet: "0x8decaec0", claim: "0x379607f5", faucet: "0x57915897", approve: "0x095ea7b3", houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77" };
 
 const u = (v) => BigInt(v).toString(16).padStart(64, "0");

@@ -12,7 +12,7 @@
     INJ: { id: "7a5bc1d2b56ad029048cd63964b3ad2776eadf812edc1a43a31406cb54bff592", label: "INJ/USD" }
   };
   var HIST_MS = 60000, PLAY_MS = 30000;
-  var TF = 30, POLL_MS = 1200, EXPO = -8; // BTC/ETH/INJ Pyth feeds are expo -8
+  var TF = 15, POLL_MS = 1200, EXPO = -8; // BTC/ETH/INJ Pyth feeds are expo -8; markets are 15s
   var CHIPS_MAX_CAP = 1000;
 
   /* ---------- state ---------- */
