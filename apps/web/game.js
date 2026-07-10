@@ -24,7 +24,7 @@
     muted: localStorage.predict_mute === "1",
     feeds: {}, rounds: {}, hist: {},
     hover: null, press: null, flash: null,
-    feedMode: "live", lastAnyTick: 0
+    feedMode: "live", lastAnyTick: Date.now() // boot grace: don't fall into sim before the stream ever connects
   };
   assets.forEach(function (a) { S.feeds[a] = { samples: [], disp: null, lastTick: 0 }; S.rounds[a] = null; S.hist[a] = []; });
 
@@ -90,9 +90,14 @@
     es.onerror = function () { try { es.close(); } catch (e) {} scheduleRetry(); };
   }
   function scheduleRetry() { setTimeout(connectFeed, retryMs); retryMs = Math.min(retryMs * 2, 15000); }
-  function pushSample(a, p) {
+  function pushSample(a, p, sim) {
     var f = S.feeds[a], t = Date.now();
-    f.samples.push({ t: t, p: p }); f.lastTick = t;
+    if (!sim && f._hasSim) { // first live tick after a sim stretch: drop the fabricated history
+      f.samples = f.samples.filter(function (s) { return !s.sim; });
+      f._hasSim = false;
+    }
+    f.samples.push({ t: t, p: p, sim: !!sim }); f.lastTick = t;
+    if (sim) f._hasSim = true;
     var cutoff = t - (HIST_MS + PLAY_MS + 30000);
     while (f.samples.length && f.samples[0].t < cutoff) f.samples.shift();
     if (f.disp === null) f.disp = p;
@@ -102,9 +107,10 @@
     S.feedMode = "sim";
     assets.forEach(function (a) {
       var f = S.feeds[a];
-      var last = f.samples.length ? f.samples[f.samples.length - 1].p : { BTC: 67000, ETH: 3500, INJ: 25 }[a];
+      if (!f.samples.length) return; // never invent a price level — only extrapolate a known one
+      var last = f.samples[f.samples.length - 1].p;
       f._accum = (f._accum || 0) + dt;
-      if (f._accum > 400) { f._accum = 0; pushSample(a, last * (1 + (Math.random() - 0.5) * 0.0008)); }
+      if (f._accum > 400) { f._accum = 0; pushSample(a, last * (1 + (Math.random() - 0.5) * 0.0008), true); }
     });
   }
 
