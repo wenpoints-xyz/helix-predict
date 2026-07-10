@@ -69,6 +69,13 @@
   $("mutebtn").onclick = function () { S.muted = !S.muted; localStorage.predict_mute = S.muted ? "1" : "0"; updateMuteBtn(); };
   updateMuteBtn();
 
+  /* ---------- build stamp (footer): sha injected at deploy; tap shows deploy time ---------- */
+  var verEl = $("ver");
+  if (verEl) {
+    if (verEl.textContent.indexOf("__") >= 0) { verEl.textContent = "dev build"; verEl.removeAttribute("data-time"); }
+    verEl.onclick = function () { toast(verEl.dataset.time ? "deployed " + verEl.dataset.time : "local dev build"); };
+  }
+
   /* ---------- price feed: Pyth Hermes SSE (wall-clock samples) ---------- */
   var es = null, retryMs = 1000;
   var ID2ASSET = {};

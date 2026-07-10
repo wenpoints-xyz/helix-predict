@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>PREDICT.EXE — $HELIXPOINT arcade</title>
-<link rel="icon" type="image/png" href="icon.png">
+<link rel="icon" type="image/png" href="icon.png?v=2">
 <meta name="description" content="30-second up/down price arcade on Injective. Fake points, real prices, real adrenaline. POC.">
 <style>
   :root, [data-theme="dark"] {
@@ -180,7 +180,8 @@
 
 <div class="foot">
   Tap the <b>green zone</b> if the price ends <b>above</b> the line, the <b>red zone</b> if below. Win at fixed odds vs the house.<br>
-  Fake points. Real prices (Pyth). Real adrenaline. On-chain version <span class="blink">under construction</span> 🚧
+  Fake points. Real prices (Pyth). Real adrenaline.
+  <span id="ver" data-time="__BUILD_TIME__" style="font-family:var(--mono);cursor:pointer;" title="tap for deploy time">build __BUILD_SHA__</span>
 </div>
 
 <script src="chain.js?v=2"></script>

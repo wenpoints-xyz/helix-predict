@@ -18,8 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Version asset URLs per deploy (cache busting)
-        run: sed -i "s/\.js?v=[0-9a-z]*/.js?v=${GITHUB_SHA::7}/g" apps/web/index.html
+      - name: Stamp build (cache-bust all versioned assets + footer sha/time)
+        run: |
+          sed -i "s/?v=[0-9a-z]*/?v=${GITHUB_SHA::7}/g" apps/web/index.html
+          sed -i "s/__BUILD_SHA__/${GITHUB_SHA::7}/; s/__BUILD_TIME__/$(date -u '+%Y-%m-%d %H:%M UTC')/" apps/web/index.html
 
       - name: Deploy to Cloudflare Pages
         id: deploy
