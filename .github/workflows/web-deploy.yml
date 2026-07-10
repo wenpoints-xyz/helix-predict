@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Version asset URLs per deploy (cache busting)
+        run: sed -i "s/\.js?v=[0-9a-z]*/.js?v=${GITHUB_SHA::7}/g" apps/web/index.html
       - name: Deploy to Cloudflare Pages (production)
         uses: cloudflare/wrangler-action@v3
         with:
