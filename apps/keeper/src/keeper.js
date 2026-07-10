@@ -77,7 +77,8 @@ async function pythUpdate(feedId) {
   const j = await r.json();
   const data = j?.binary?.data;
   if (!Array.isArray(data) || !data.length) throw new Error("hermes: no update data");
-  return data.map((h) => (h.startsWith("0x") ? h : "0x" + h));
+  const publishTime = Number(j?.parsed?.[0]?.price?.publish_time || 0);
+  return { data: data.map((h) => (h.startsWith("0x") ? h : "0x" + h)), publishTime };
 }
 
 async function send(label, fn) {
@@ -102,17 +103,32 @@ function createNext(m, now) {
   );
 }
 
-async function lockOrSettle(kind, rid, feedId) {
-  let updateData;
+// One in-flight lock/settle attempt per market: the Hermes fetch is async, so without this two
+// consecutive blocks could both fetch + fire, double-sending (the 2nd reverts NotOpen).
+const inFlight = {};
+async function lockOrSettle(kind, mid, rid, feedId, minPublishTime) {
+  if (inFlight[mid]) return;
+  inFlight[mid] = true;
   try {
-    updateData = await pythUpdate(feedId);
-  } catch (e) {
-    return log(`${kind} r${rid} skip: ${short(e)}`);
+    let upd;
+    try {
+      upd = await pythUpdate(feedId);
+    } catch (e) {
+      return log(`${kind} r${rid} skip: ${short(e)}`);
+    }
+    // Pyth/Hermes lags wall-clock by a couple seconds, and lock()/settle() REQUIRE the price's
+    // publishTime >= the window (lockTime / expiryTime). Sending an older price just reverts
+    // (PriceBeforeWindow) and burns gas + a cooldown, then retries. Instead, wait (retry next
+    // block) until Hermes has caught up past the window, then send once — the real fix for latency.
+    if (upd.publishTime < minPublishTime) return;
+    markActed(mid); // only now (we're actually sending) so the waiting blocks keep retrying
+    const fee = await pyth.getUpdateFee(upd.data);
+    await send(`${kind} r${rid}`, (nonce) =>
+      house[kind](rid, upd.data, { value: fee, nonce, gasLimit: GAS_LIMIT })
+    );
+  } finally {
+    inFlight[mid] = false;
   }
-  const fee = await pyth.getUpdateFee(updateData);
-  await send(`${kind} r${rid}`, (nonce) =>
-    house[kind](rid, updateData, { value: fee, nonce, gasLimit: GAS_LIMIT })
-  );
 }
 
 async function handleMarket(m, now) {
@@ -147,10 +163,7 @@ async function handleMarket(m, now) {
       markActed(mid);
       return voidExp();
     }
-    if (now >= lockT) {
-      markActed(mid);
-      return lockOrSettle("lock", rid, m.feedId);
-    }
+    if (now >= lockT) return lockOrSettle("lock", mid, rid, m.feedId, lockT); // marks acted only on the actual send
     return; // still taking bets
   }
 
@@ -159,10 +172,7 @@ async function handleMarket(m, now) {
       markActed(mid);
       return voidExp();
     }
-    if (now >= expT) {
-      markActed(mid);
-      return lockOrSettle("settle", rid, m.feedId);
-    }
+    if (now >= expT) return lockOrSettle("settle", mid, rid, m.feedId, expT);
     return; // waiting for expiry
   }
 }
