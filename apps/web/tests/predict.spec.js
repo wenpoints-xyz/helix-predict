@@ -222,7 +222,7 @@ test("my own position suppresses NO BETS on a stale empty board", async ({ page 
   });
   await page.goto("/");
   await page.click("#connect");
-  await expect(page.locator("#phase")).toHaveText(/LOCKING…/); // pending-lock view, never "NO BETS"
+  await expect(page.locator("#phase")).toHaveText(/LOCKING/); // pending-lock view, never "NO BETS"
 });
 
 test("roll transitions straight to next round's betting — LOCKED never rendered", async ({ page }) => {
@@ -261,5 +261,5 @@ test("regression: non-empty round past lockTime still shows the pending-lock vie
   const now = Math.floor(Date.now() / 1000);
   await setup(page, { board: board({ 0: { hasRound: true, roundId: 11, state: 0, lockTime: now - 3, expiryTime: now + 12, upPool: 40n * E18, downPool: 0n } }) });
   await page.goto("/");
-  await expect(page.locator("#phase")).toHaveText(/LOCKING…/);
+  await expect(page.locator("#phase")).toHaveText(/LOCKING/);
 });

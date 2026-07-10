@@ -23,7 +23,7 @@
   var S = {
     asset: "BTC",
     stake: parseInt(localStorage.predict_stake || "25", 10) || 25,
-    bal: null, acct: null, board: [], seen: {}, pendingBet: {},
+    bal: null, acct: null, board: [], seen: {}, pendingBet: {}, prov: {},
     muted: localStorage.predict_mute === "1",
     feeds: {}, rounds: {}, hist: {},
     hover: null, press: null, flash: null,
@@ -93,20 +93,20 @@
         var a = ID2ASSET[(u.id || "").replace(/^0x/, "").toLowerCase()];
         if (!a || !u.price) return;
         var p = Number(u.price.price) * Math.pow(10, u.price.expo);
-        if (p > 0) pushSample(a, p);
+        if (p > 0) pushSample(a, p, false, Number(u.price.publish_time || 0)); // keep publish_time to match the on-chain strike
       });
       retryMs = 1000; S.feedMode = "live"; S.lastAnyTick = Date.now();
     };
     es.onerror = function () { try { es.close(); } catch (e) {} scheduleRetry(); };
   }
   function scheduleRetry() { setTimeout(connectFeed, retryMs); retryMs = Math.min(retryMs * 2, 15000); }
-  function pushSample(a, p, sim) {
+  function pushSample(a, p, sim, pt) {
     var f = S.feeds[a], t = Date.now();
     if (!sim && f._hasSim) { // first live tick after a sim stretch: drop the fabricated history
       f.samples = f.samples.filter(function (s) { return !s.sim; });
       f._hasSim = false;
     }
-    f.samples.push({ t: t, p: p, sim: !!sim }); f.lastTick = t;
+    f.samples.push({ t: t, p: p, sim: !!sim, pt: pt || 0 }); f.lastTick = t; // pt = Pyth publish_time (0 for sim)
     if (sim) f._hasSim = true;
     var cutoff = t - 120000; // covers the widest window (4×timeframe) plus settle-wait slack
     while (f.samples.length && f.samples[0].t < cutoff) f.samples.shift();
@@ -157,6 +157,22 @@
     r.lockMult = { up: pm, down: pm };
     return r;
   }
+  // Effective strike + status. The on-chain strike is final once it lands (~4-6s after lockTime given
+  // Pyth's ~3s publish lag + mine time). Before that, freeze a provisional the instant betting closes so
+  // the lock feels immediate, then snap to the EXACT price the contract locks — the first streamed Pyth
+  // sample whose publish_time >= lockTime — the moment it arrives. No dependence on the laggy chain read.
+  function strikeFor(r, f) {
+    if (!r || !f) return { p: f && f.disp, status: "live" };
+    if (r.strike) return { p: r.strike, status: "locked" }; // on-chain, authoritative
+    if (r.phase !== "play" || !r.lockTime) return { p: f.disp, status: "live" }; // still betting / no round
+    var key = r.roundId, lockSec = r.lockTime / 1000, confirmed = null;
+    for (var i = 0; i < f.samples.length; i++) {
+      if (f.samples[i].pt && f.samples[i].pt >= lockSec) { confirmed = f.samples[i].p; break; } // == the on-chain strike
+    }
+    if (confirmed != null) { S.prov[key] = confirmed; return { p: confirmed, status: "locked" }; }
+    if (S.prov[key] == null) S.prov[key] = f.disp; // instant freeze at the lock-moment price
+    return { p: S.prov[key], status: "locking" };
+  }
   function poll() {
     if (!PX.NET.live) return;
     PX.boardSnapshot().then(function (board) {
@@ -192,6 +208,7 @@
   }
   function recordResult(a, m, pos) {
     S.seen[m.roundId] = true;
+    delete S.prov[m.roundId]; // round done — drop its provisional-strike cache
     var up = pos ? PX.toChips(pos.up) : 0, down = pos ? PX.toChips(pos.down) : 0;
     var claimable = pos ? PX.toChips(pos.claimable) : 0, claimed = pos ? pos.claimed : false;
     var dir = m.voided ? "tie" : (m.upWon ? "up" : "down");
@@ -450,7 +467,7 @@
 
     var lo = Infinity, hi = -Infinity;
     for (var i = 0; i < f.samples.length; i++) { var sm = f.samples[i]; if (sm.t < t0) continue; if (sm.p < lo) lo = sm.p; if (sm.p > hi) hi = sm.p; }
-    var strike = r && r.strike ? r.strike : f.disp;
+    var strike = strikeFor(r, f).p;
     if (strike < lo) lo = strike; if (strike > hi) hi = strike;
     var pad = Math.max((hi - lo) * 0.35, strike * 0.0004);
     var tMin = lo - pad, tMax = hi + pad;
@@ -565,7 +582,7 @@
     if (x < splitX) return null;
     var f = S.feeds[S.asset], r = S.rounds[S.asset];
     if (!r || !f.samples.length) return null;
-    var strike = r.strike ? r.strike : f.disp;
+    var strike = strikeFor(r, f).p;
     var strikeY = Math.max(26, Math.min(H - 26, H - (strike - yScale.min) / (yScale.max - yScale.min) * H));
     return y < strikeY ? "up" : "down";
   }
@@ -628,7 +645,7 @@
       if (r.phase === "roll") { el.phase.textContent = now - r.rollSince > 10000 ? "NO BETS — WAITING FOR NEXT ROUND" : "NO BETS — NEXT ROUND SOON"; el.phase.className = "phase"; }
       else if (r.phase === "bet" && now < r.tEnd) { el.phase.textContent = "PLACE YOUR BETS"; el.phase.className = "phase hot"; }
       else if (r.state === 2) { el.phase.textContent = r.voided ? "VOID — REFUND" : (r.upWon ? "UP WINS" : "DOWN WINS"); el.phase.className = "phase locked"; }
-      else { el.phase.textContent = r.strike ? "LOCKED @ " + fmt(r.strike) : "LOCKING…"; el.phase.className = "phase locked"; }
+      else { var sk = strikeFor(r, f); el.phase.textContent = (sk.status === "locked" ? "LOCKED @ " : "LOCKING @ ~") + fmt(sk.p); el.phase.className = "phase locked"; }
     }
     var fresh = now - f.lastTick < 5000;
     el.led.className = "led" + ((fresh || S.feedMode === "sim") ? " on" : "");
