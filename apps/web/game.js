@@ -20,7 +20,7 @@
   var S = {
     asset: "BTC",
     stake: parseInt(localStorage.predict_stake || "25", 10) || 25,
-    bal: null, acct: null, board: [], seen: {},
+    bal: null, acct: null, board: [], seen: {}, pendingBet: {},
     muted: localStorage.predict_mute === "1",
     feeds: {}, rounds: {}, hist: {},
     hover: null, press: null, flash: null,
@@ -137,6 +137,7 @@
     var r = {
       n: m.roundId, roundId: m.roundId, state: m.state, upWon: m.upWon, voided: m.voided,
       phase: betting ? "bet" : "play",
+      lockTime: m.lockTime * 1000,
       tEnd: (betting ? m.lockTime : m.expiryTime) * 1000,
       strike: strike, payoutBps: m.payoutBps,
       pools: { up: PX.toChips(m.upPool), down: PX.toChips(m.downPool) },
@@ -159,6 +160,18 @@
           if (r) {
             var p = by[r.roundId];
             if (p) { r.my.up = PX.toChips(p.up); r.my.down = PX.toChips(p.down); r.claimable = PX.toChips(p.claimable); r.claimed = p.claimed; }
+            if (r.my.up + r.my.down > 0 || S.pendingBet[r.roundId] < Date.now() - 45000) delete S.pendingBet[r.roundId];
+            // EMPTY round past lockTime: the keeper never locks it (no Pyth fee for empty
+            // rounds) — it orphans it and opens the next slot. Mirror that: "roll" phase, no
+            // fake lock. Own bets/pending txs suppress it — the board poll is ~1.2s stale and
+            // "NO BETS" must never flash at a user who just bet.
+            if (r.state === 0 && Date.now() >= r.lockTime &&
+                r.pools.up + r.pools.down === 0 && r.my.up + r.my.down === 0 &&
+                !S.pendingBet[r.roundId]) {
+              r.phase = "roll";
+              var prev = S.rounds[a];
+              r.rollSince = (prev && prev.roundId === r.roundId && prev.rollSince) || Date.now();
+            }
           }
           if (m && m.hasRound && m.state === 2 && !S.seen[m.roundId]) recordResult(a, m, by[m.roundId]);
           S.rounds[a] = r;
@@ -270,16 +283,18 @@
   function placeBet(side) {
     if (!S.acct) { openWallet(); return; }
     var r = S.rounds[S.asset];
+    if (r && r.phase === "roll") return; // tiles are visibly disabled — no error beep
     if (!r || r.phase !== "bet" || Date.now() >= r.tEnd) { beep(160, 40, "sawtooth"); return; }
     var chips = stakeValue();
     if (chips <= 0) { beep(160, 60, "sawtooth"); return; }
     if (S.bal != null && S.bal < chips) { el.getpts.hidden = false; beep(160, 60, "sawtooth"); toast("Not enough points — hit the faucet."); return; }
     var amt = PX.chipsToWei(chips), prov = PX.wallet.provider, from = S.acct, rid = r.roundId, up = side === "up";
     beep(600, 30); if (navigator.vibrate) navigator.vibrate(12);
+    S.pendingBet[rid] = Date.now(); // suppresses the "NO BETS" roll state until the board sees it
     ensureAllowance(from, amt)
       .then(function () { return PX.bet(prov, from, rid, up, amt); })
       .then(function () { flyPoints("bet " + chips, PAL.accent, side); setTimeout(poll, 1500); })
-      .catch(function (e) { toast(txErr(e, "Bet failed.")); });
+      .catch(function (e) { delete S.pendingBet[rid]; toast(txErr(e, "Bet failed.")); });
   }
   function ensureAllowance(from, amt) {
     return PX.allowance(from, PX.NET.pool).then(function (a) {
@@ -429,9 +444,10 @@
     var strikeY = Math.max(26, Math.min(H - 26, yOf(strike)));
 
     var betting = r && r.phase === "bet";
+    var rolling = r && r.phase === "roll";
     var zones = [{ side: "up", y0: 0, y1: strikeY, col: PAL.ok }, { side: "down", y0: strikeY, y1: H, col: PAL.bad }];
     zones.forEach(function (z) {
-      var alpha = 0.10;
+      var alpha = rolling ? 0.04 : 0.10;
       if (betting && S.hover === z.side) alpha = 0.17;
       if (betting && S.press === z.side) alpha = 0.26;
       if (r && r.my[z.side] > 0) alpha += 0.05;
@@ -454,8 +470,8 @@
     ctx.strokeStyle = PAL["ink-dim"]; ctx.globalAlpha = 0.4; ctx.setLineDash([3, 3]);
     ctx.beginPath(); ctx.moveTo(splitX, 0); ctx.lineTo(splitX, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
 
-    ctx.strokeStyle = PAL.accent; ctx.lineWidth = betting ? 1.5 : 2;
-    if (betting) ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = PAL.accent; ctx.lineWidth = betting || rolling ? 1.5 : 2;
+    if (betting || rolling) ctx.setLineDash([6, 4]);
     ctx.beginPath(); ctx.moveTo(0, strikeY); ctx.lineTo(W, strikeY); ctx.stroke(); ctx.setLineDash([]);
     var tag = "@ " + fmt(strike);
     ctx.font = "bold 11px 'Courier New',monospace";
@@ -478,7 +494,15 @@
     ctx.globalAlpha = 0.25; ctx.beginPath(); ctx.arc(headX, headY, 7, 0, 7); ctx.fill();
     ctx.globalAlpha = 1; ctx.beginPath(); ctx.arc(headX, headY, 3, 0, 7); ctx.fill();
 
-    if (r) {
+    if (r && rolling) {
+      // empty round rolled by the keeper: calm beat, no fake lock theater
+      var rx = splitX + (W - splitX) / 2;
+      ctx.textAlign = "center"; ctx.fillStyle = PAL["ink-dim"];
+      ctx.font = "bold 14px " + COMIC_CANVAS;
+      ctx.fillText("NO BETS", rx, H / 2 - 8);
+      ctx.font = "11px 'Courier New',monospace";
+      ctx.fillText(now - r.rollSince > 10000 ? "waiting for next round…" : "rolling to next round…", rx, H / 2 + 12);
+    } else if (r) {
       var zx = splitX + (W - splitX) / 2;
       zones.forEach(function (z) {
         var mid = (z.y0 + z.y1) / 2;
@@ -580,9 +604,10 @@
       el.phase.className = "phase"; el.clock.textContent = "0:00"; el.rid.textContent = "ROUND #—";
     } else {
       var s = Math.ceil(Math.max(0, r.tEnd - now) / 1000);
-      el.clock.textContent = Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
+      el.clock.textContent = r.phase === "roll" ? "—" : Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
       el.rid.textContent = "ROUND #" + r.n;
-      if (r.phase === "bet" && now < r.tEnd) { el.phase.textContent = "PLACE YOUR BETS"; el.phase.className = "phase hot"; }
+      if (r.phase === "roll") { el.phase.textContent = now - r.rollSince > 10000 ? "NO BETS — WAITING FOR NEXT ROUND" : "NO BETS — NEXT ROUND SOON"; el.phase.className = "phase"; }
+      else if (r.phase === "bet" && now < r.tEnd) { el.phase.textContent = "PLACE YOUR BETS"; el.phase.className = "phase hot"; }
       else if (r.state === 2) { el.phase.textContent = r.voided ? "VOID — REFUND" : (r.upWon ? "UP WINS" : "DOWN WINS"); el.phase.className = "phase locked"; }
       else { el.phase.textContent = r.strike ? "LOCKED @ " + fmt(r.strike) : "LOCKING…"; el.phase.className = "phase locked"; }
     }

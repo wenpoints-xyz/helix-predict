@@ -196,3 +196,70 @@ test("LP panel: shows bankroll from houseStats and sends a deposit to the vault"
   expect(txs.some((t) => t.sel === SEL.approve)).toBeTruthy(); // approved points to the vault first
   expect(txs.find((t) => t.sel === SEL.deposit).to).toBe(VAULT); // deposit lands on the vault
 });
+
+/* ---------- empty-round roll-through (no fake lock) ---------- */
+
+const emptyPastLock = (now, id) => board({ 0: { hasRound: true, roundId: id != null ? id : 9, state: 0, lockTime: now - 5, expiryTime: now + 10, upPool: 0n, downPool: 0n } });
+
+test("empty round past lockTime rolls: NO BETS label, no clock, tap fires no tx", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, { board: emptyPastLock(now), balance: 100n * E18, allowance: 1n << 255n });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#phase")).toHaveText(/NO BETS — NEXT ROUND SOON/);
+  await expect(page.locator("#clock")).toHaveText("—");
+  await upZoneClick(page);
+  await page.waitForTimeout(500);
+  const txs = await sent(page);
+  expect(txs.some((t) => t.sel === SEL.bet)).toBeFalsy(); // disabled tiles: tap does nothing
+});
+
+test("my own position suppresses NO BETS on a stale empty board", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, {
+    board: emptyPastLock(now),
+    positions: positions([25n * E18], [0n], [0n], [false]) // I bet 25 UP; board pools stale at 0
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#phase")).toHaveText(/LOCKING…/); // pending-lock view, never "NO BETS"
+});
+
+test("roll transitions straight to next round's betting — LOCKED never rendered", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, { board: emptyPastLock(now) });
+  await page.goto("/");
+  await expect(page.locator("#phase")).toHaveText(/NO BETS/);
+  await page.evaluate(() => {
+    window.__phases = [];
+    const el = document.getElementById("phase");
+    new MutationObserver(() => window.__phases.push(el.textContent)).observe(el, { childList: true, characterData: true, subtree: true });
+  });
+  const fresh = board({ 0: { hasRound: true, roundId: 10, state: 0, lockTime: now + 12, expiryTime: now + 27, upPool: 0n, downPool: 0n } });
+  await page.route((url) => url.host.includes("k8s.testnet.json-rpc"), async (route) => {
+    const req = JSON.parse(route.request().postData() || "{}");
+    if (req.method === "eth_call" && (req.params[0].data || "").startsWith(SEL.board)) {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify({ jsonrpc: "2.0", id: req.id, result: fresh }) });
+    } else await route.fallback();
+  });
+  await expect(page.locator("#phase")).toHaveText(/PLACE YOUR BETS/);
+  await expect(page.locator("#rid")).toHaveText("ROUND #10");
+  const phases = await page.evaluate(() => window.__phases);
+  expect(phases.some((p) => /LOCK/.test(p))).toBeFalsy(); // no fake-lock flap in between
+});
+
+test("roll persisting >10s escalates to waiting copy", async ({ page }) => {
+  test.setTimeout(30000);
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, { board: emptyPastLock(now) });
+  await page.goto("/");
+  await expect(page.locator("#phase")).toHaveText(/NO BETS — NEXT ROUND SOON/);
+  await expect(page.locator("#phase")).toHaveText(/WAITING FOR NEXT ROUND/, { timeout: 15000 });
+});
+
+test("regression: non-empty round past lockTime still shows the pending-lock view", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, { board: board({ 0: { hasRound: true, roundId: 11, state: 0, lockTime: now - 3, expiryTime: now + 12, upPool: 40n * E18, downPool: 0n } }) });
+  await page.goto("/");
+  await expect(page.locator("#phase")).toHaveText(/LOCKING…/);
+});
