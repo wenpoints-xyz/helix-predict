@@ -383,7 +383,11 @@
       return;
     }
     var last = f.samples[f.samples.length - 1].p;
-    f.disp += (last - f.disp) * 0.18;
+    // ease toward the live price, but snap when far off (>0.2%) — disp goes stale for
+    // background tabs (easing only runs for the active asset), and a visible glide from
+    // a minutes-old price reads as a wrong price, not an animation
+    if (Math.abs(last - f.disp) > last * 0.002) f.disp = last;
+    else f.disp += (last - f.disp) * 0.18;
 
     var playing = r && r.phase === "play";
     var t1 = playing ? r.tEnd : now + PLAY_MS;
@@ -512,6 +516,8 @@
   $("tabs").addEventListener("click", function (e) {
     var b = e.target.closest(".tab"); if (!b) return;
     S.asset = b.dataset.asset; yScale.init = false;
+    var f = S.feeds[S.asset]; // snap the stale display price before this tab's first draw
+    if (f && f.samples.length) f.disp = f.samples[f.samples.length - 1].p;
     document.querySelectorAll(".tab").forEach(function (t) { t.setAttribute("aria-pressed", t === b ? "true" : "false"); });
     renderHist();
   });
