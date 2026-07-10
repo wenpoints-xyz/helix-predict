@@ -1,0 +1,4 @@
+# JS must revalidate on every load (etag 304s are cheap) — an unversioned game.js
+# cached for 4h means shipped fixes don't reach phones until the cache expires.
+/*.js
+  Cache-Control: no-cache
