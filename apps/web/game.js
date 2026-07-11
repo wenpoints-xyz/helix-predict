@@ -384,10 +384,50 @@
     toastEl.textContent = msg; toastEl.style.display = "block";
     clearTimeout(toastT); toastT = setTimeout(function () { toastEl.style.display = "none"; }, 4200);
   }
+  // Wallets bury a reverting contract's custom error as a 4-byte selector somewhere in the error
+  // payload (data / info.error.data / message), not as a readable string. Map every user-reachable
+  // revert to plain language by matching its selector. Selectors from PredictionBook + HouseVault +
+  // OZ Pausable/ERC20/ERC4626 (keccak(sig)[0:4]); keep in sync if the contract's errors change.
+  var ERRMAP = {
+    "0xd312a688": "That's below the minimum bet.",
+    "0x217b2dd1": "That's over the max bet — try a smaller stake.",
+    "0x59a5f145": "You've got too many open bets — settle some first.",
+    "0x843e7985": "Too big for the house right now — try a smaller stake.",
+    "0x137b0798": "The house is full right now — try a smaller stake, or again in a bit.",
+    "0xbb113ce1": "The house can't cover that right now — smaller stake, or add LP.",
+    "0x1f2a2005": "Enter an amount first.",
+    "0x52a422f7": "This market is paused.",
+    "0xac8a2f48": "That market isn't available.",
+    "0x4d84c2e9": "Pick a valid duration.",
+    "0xddafad98": "This bet was already settled.",
+    "0x111c4409": "Not ready to settle yet — give it a few seconds.",
+    "0x3937f51f": "Can't refund yet — the settlement grace hasn't passed.",
+    "0x025dbdd4": "Oracle fee too low — try again.",
+    "0x969bf728": "Nothing to claim here.",
+    "0xd93c0665": "Betting is paused right now.",
+    "0xe450d38c": "Not enough points for that.",
+    "0xfb8f41b2": "Approve points first, then retry.",
+    "0xfe9cceec": "Can't withdraw that much — capital is backing open bets.",
+    "0xb94abeec": "Can't withdraw that much — capital is backing open bets."
+  };
+  function errBlob(e) {
+    var parts = [];
+    try { parts.push(JSON.stringify(e)); } catch (_) {}
+    [e, e && e.data, e && e.data && e.data.data, e && e.error, e && e.error && e.error.data,
+     e && e.info, e && e.info && e.info.error, e && e.info && e.info.error && e.info.error.data].forEach(function (o) {
+      if (o == null) return;
+      if (typeof o === "string") { parts.push(o); return; }
+      if (o.message) parts.push(o.message);
+      if (typeof o.data === "string") parts.push(o.data);
+      if (o.reason) parts.push(o.reason);
+    });
+    return parts.join(" ").toLowerCase();
+  }
   function txErr(e, fallback) {
     if (e && e.code === 4001) return "Cancelled.";
-    var m = ((e && (e.message || (e.data && e.data.message) || (e.error && e.error.message))) || "").toLowerCase();
-    if (m.indexOf("insufficient funds") !== -1 || m.indexOf("sender balance") !== -1 || m.indexOf("gas required") !== -1)
+    var s = errBlob(e);
+    for (var sel in ERRMAP) if (s.indexOf(sel) !== -1) return ERRMAP[sel];
+    if (s.indexOf("insufficient funds") !== -1 || s.indexOf("sender balance") !== -1 || s.indexOf("gas required") !== -1)
       return HAS_FAUCET ? "No gas — get testnet INJ free at faucet.injective.network, then retry." : "No gas — you need a little INJ for fees, then retry.";
     return fallback;
   }
@@ -1019,9 +1059,9 @@
   resize();
   refreshConnectBtn();
   el.netbanner.style.display = "none";
-  if (!HAS_FAUCET) { // mainnet: real $HELIXPOINT, not play money
-    var rn = document.getElementById("realnote"); if (rn) rn.textContent = "mainnet · real $HELIXPOINT";
-    var tg = document.getElementById("tagline"); if (tg) tg.textContent = "Real $HELIXPOINT. Real prices (Pyth). Real stakes.";
+  if (!HAS_FAUCET) { // mainnet: $HELIXPOINT at stake (no faucet)
+    var rn = document.getElementById("realnote"); if (rn) rn.textContent = "mainnet · $HELIXPOINT";
+    var tg = document.getElementById("tagline"); if (tg) tg.textContent = "$HELIXPOINT stakes. Pyth prices. Fixed odds vs the house.";
   }
   updateBalance();
   renderHist();
