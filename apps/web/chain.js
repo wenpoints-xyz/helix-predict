@@ -19,7 +19,8 @@
       points: "0x52045F671C452b7f91a7e436c64f126E78638F14", // MockPoints — has a faucet
       live: true,
       faucet: true,        // MockPoints can be minted for free (test money)
-      stakeSymbol: "points"
+      stakeSymbol: "points",
+      chips: [10, 25, 50, 100] // stake presets (test money scale)
     },
     prod: {
       key: "prod", name: "Injective Mainnet", chainIdHex: "0x6f0", // 1776
@@ -32,7 +33,8 @@
       live: true,
       faucet: false,       // NO faucet — HELIXPOINT is real; users buy it (see buyUrl)
       buyUrl: "https://pump.trippyinj.xyz/launch/8",
-      stakeSymbol: "$HELIXPOINT"
+      stakeSymbol: "$HELIXPOINT",
+      chips: [100000, 500000, 1000000, 10000000] // stake presets ($HELIXPOINT scale): 100K/500K/1M/10M
     }
   };
   function pickNet() {

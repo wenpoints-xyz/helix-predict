@@ -393,7 +393,12 @@
   }
 
   /* ---------- betting (open a position) ---------- */
-  function stakeValue() { return S.stake === "max" ? Math.max(0, Math.min(S.bal || 0, CHIPS_MAX_CAP)) : S.stake; }
+  // MAX = your balance, capped by the contract's maxBet (so it never opens a doomed over-cap bet).
+  function stakeValue() {
+    if (S.stake !== "max") return S.stake;
+    var cap = S.cfg && S.cfg.maxBet ? PX.toChips(S.cfg.maxBet) : CHIPS_MAX_CAP;
+    return Math.max(0, Math.floor(Math.min(S.bal || 0, cap)));
+  }
   function placeBet(side) {
     if (!S.acct) { openWallet(); return; }
     var mid = S.markets[S.asset];
@@ -904,6 +909,27 @@
     document.querySelectorAll(".tab").forEach(function (t) { t.setAttribute("aria-pressed", t === b ? "true" : "false"); });
     renderHist();
   });
+  // Compact chip label: 100000 -> "100K", 1000000 -> "1M", 10000000 -> "10M".
+  function fmtChip(v) {
+    if (v >= 1e6) return (v / 1e6).toString().replace(/\.0$/, "") + "M";
+    if (v >= 1e3) return (v / 1e3).toString().replace(/\.0$/, "") + "K";
+    return String(v);
+  }
+  // Build the numeric stake chips from the network's presets ($HELIXPOINT scale on mainnet,
+  // points scale on testnet), inserting them before the MAX button.
+  (function buildChips() {
+    var chips = (PX.NET.chips && PX.NET.chips.length) ? PX.NET.chips : [10, 25, 50, 100];
+    var maxBtn = document.querySelector('.chip[data-v="max"]');
+    var frag = document.createDocumentFragment();
+    chips.forEach(function (v) {
+      var b = document.createElement("button");
+      b.className = "chip"; b.dataset.v = String(v); b.textContent = fmtChip(v);
+      frag.appendChild(b);
+    });
+    maxBtn.parentNode.insertBefore(frag, maxBtn);
+    // a stored stake from another network's scale won't exist here — fall back to the first preset
+    if (S.stake !== "max" && chips.indexOf(S.stake) < 0) { S.stake = chips[0]; localStorage.predict_stake = S.stake; }
+  })();
   document.querySelectorAll(".chip").forEach(function (c) {
     c.addEventListener("click", function () {
       S.stake = c.dataset.v === "max" ? "max" : parseInt(c.dataset.v, 10);
