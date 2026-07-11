@@ -805,7 +805,11 @@
     // live price readout riding the dot while the bet is running (pre-close): ▲ green above strike / ▼ red below
     if (v && v.phase === "live" && v.strike != null) {
       var live = f.disp, strike = v.strike;
-      var col = live > strike ? PAL.ok : live < strike ? PAL.bad : PAL["ink-dim"];
+      // colour by whether YOUR bet is winning (ahead), not raw price vs strike: a DOWN bet is
+      // ahead (green) when price is BELOW its strike. Arrow still shows price direction vs strike.
+      var ahead = v.up ? live > strike : live < strike;
+      var behind = v.up ? live < strike : live > strike;
+      var col = ahead ? PAL.ok : behind ? PAL.bad : PAL["ink-dim"];
       var arrow = live > strike ? "▲" : live < strike ? "▼" : "•";
       var txt = arrow + " " + fmt(live);
       var rx = Math.min(headX - 8, W - 4);
@@ -946,8 +950,12 @@
         if (v.strikeStatus !== "locked") {
           el.phase.textContent = "LOCKING…"; el.phase.className = "phase hot"; // strike still gliding to its exact value
         } else {
-          var lead = f.disp > v.strike ? "▲ AHEAD" : f.disp < v.strike ? "▼ BEHIND" : "EVEN";
-          el.phase.textContent = lead + " @ " + fmt(v.strike); el.phase.className = "phase locked";
+          // ahead/behind is relative to YOUR side: a DOWN bet is ahead when price < strike.
+          var even = f.disp === v.strike;
+          var ahead = v.up ? f.disp > v.strike : f.disp < v.strike;
+          var lead = even ? "• EVEN" : ahead ? "▲ AHEAD" : "▼ BEHIND";
+          el.phase.textContent = lead + " @ " + fmt(v.strike);
+          el.phase.className = even ? "phase" : ahead ? "phase hot" : "phase locked"; // hot=green, locked=red
         }
         el.clock.textContent = Math.floor(sc / 60) + ":" + ("0" + (sc % 60)).slice(-2);
       } else if (v.phase === "settling") {
