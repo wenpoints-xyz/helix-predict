@@ -410,18 +410,20 @@
     "0xfe9cceec": "Can't withdraw that much — capital is backing open bets.",
     "0xb94abeec": "Can't withdraw that much — capital is backing open bets."
   };
+  // Recursively collect every string anywhere in the error object — wallets bury the revert selector
+  // at wildly different depths (e.data / data.data / data.originalError.data / info.error.data / cause…),
+  // and Error instances don't JSON.stringify their message/data. Walk the whole thing and match later.
   function errBlob(e) {
-    var parts = [];
-    try { parts.push(JSON.stringify(e)); } catch (_) {}
-    [e, e && e.data, e && e.data && e.data.data, e && e.error, e && e.error && e.error.data,
-     e && e.info, e && e.info && e.info.error, e && e.info && e.info.error && e.info.error.data].forEach(function (o) {
-      if (o == null) return;
-      if (typeof o === "string") { parts.push(o); return; }
-      if (o.message) parts.push(o.message);
-      if (typeof o.data === "string") parts.push(o.data);
-      if (o.reason) parts.push(o.reason);
-    });
-    return parts.join(" ").toLowerCase();
+    var out = [], seen = [];
+    (function walk(o, d) {
+      if (o == null || d > 6) return;
+      if (typeof o === "string") { out.push(o); return; }
+      if (typeof o !== "object") return;
+      if (seen.indexOf(o) !== -1) return; seen.push(o);
+      if (typeof o.message === "string") out.push(o.message); // non-enumerable on Error
+      for (var k in o) { try { walk(o[k], d + 1); } catch (_) {} }
+    })(e, 0);
+    return out.join(" ").toLowerCase();
   }
   function txErr(e, fallback) {
     if (e && e.code === 4001) return "Cancelled.";
@@ -448,12 +450,31 @@
     if (S.cfg && chips < PX.toChips(S.cfg.minBet)) { toast("Min bet is " + Math.ceil(PX.toChips(S.cfg.minBet)) + " pts."); beep(160, 60, "sawtooth"); return; }
     if (S.bal != null && S.bal < chips) { el.getpts.hidden = false; beep(160, 60, "sawtooth"); toast(HAS_FAUCET ? "Not enough points — hit the faucet." : "Low $HELIXPOINT — tap GET $HELIXPOINT."); return; }
     var amt = PX.chipsToWei(chips), prov = PX.wallet.provider, from = S.acct, up = side === "up", dur = S.dur;
-    beep(600, 30); if (navigator.vibrate) navigator.vibrate(12);
-    S.pendingOpen[S.asset] = { t: Date.now(), minId: (S.myBets[0] ? S.myBets[0].betId : 0) + 1 };
-    ensureAllowance(from, amt)
-      .then(function () { return PX.openBet(prov, from, mid, up, amt, dur); })
-      .then(function () { flyPoints("bet " + chips, PAL.accent, side); setTimeout(poll, 1500); })
-      .catch(function (e) { delete S.pendingOpen[S.asset]; toast(txErr(e, "Bet failed.")); });
+    function fire() {
+      beep(600, 30); if (navigator.vibrate) navigator.vibrate(12);
+      S.pendingOpen[S.asset] = { t: Date.now(), minId: (S.myBets[0] ? S.myBets[0].betId : 0) + 1 };
+      ensureAllowance(from, amt)
+        .then(function () { return PX.openBet(prov, from, mid, up, amt, dur); })
+        .then(function () { flyPoints("bet " + chips, PAL.accent, side); setTimeout(poll, 1500); })
+        .catch(function (e) { delete S.pendingOpen[S.asset]; toast(txErr(e, "Bet failed.")); });
+    }
+    // Pre-flight the house exposure caps so an oversized bet shows a precise message (with the current
+    // max) instead of a cryptic wallet revert. Read fails -> fire anyway; the contract still guards.
+    if (!S.cfg || S.cfg.maxBetExposureBps == null) { fire(); return; }
+    PX.houseStats().then(function (h) {
+      if (h.bankroll <= 0n) { toast("The house has no LP yet — deposit via BE THE HOUSE first."); beep(160, 60, "sawtooth"); return; }
+      var vig = BigInt(S.cfg.payoutBps - 10000);
+      var reserve = amt * vig; reserve = reserve === 0n ? 0n : (reserve - 1n) / 10000n + 1n; // ceil((m-1)*stake)
+      var perCap = h.bankroll * BigInt(S.cfg.maxBetExposureBps) / 10000n;
+      var aggCap = h.bankroll * BigInt(S.cfg.maxAggExposureBps) / 10000n;
+      if (reserve > perCap) {
+        var maxStake = perCap * 10000n / vig; // largest stake whose reserve fits the per-bet cap
+        toast("Too big for the house — max ~" + Math.floor(PX.toChips(maxStake)).toLocaleString("en-US") + " pts right now (LP " + Math.floor(PX.toChips(h.bankroll)).toLocaleString("en-US") + "). Bet smaller or add LP.");
+        beep(160, 60, "sawtooth"); return;
+      }
+      if (h.reserved + reserve > aggCap) { toast("The house is near capacity right now — smaller bet, or try again shortly."); beep(160, 60, "sawtooth"); return; }
+      fire();
+    }).catch(function () { fire(); });
   }
   function ensureAllowance(from, amt) {
     return PX.allowance(from, PX.NET.book).then(function (a) {

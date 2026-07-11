@@ -21,6 +21,7 @@ const SEL = {
   minDur: "0x67b38200", maxDur: "0xeab50bd2", strikeDelay: "0x51fd4c2a",
   positionsOf: "0xdc9d54ef", getPosition: "0xeb02c301", owed: "0xb1276604", settleGrace: "0x12ae6491",
   voidExpired: "0xb04fe3fa", tipBps: "0xe79ce788", maxTip: "0x7b45eb36",
+  maxBetExposureBps: "0x6faa2d3a", maxAggExposureBps: "0xd2b4eda2",
   balanceOf: "0x70a08231", allowance: "0xdd62ed3e",
   openBet: "0x058a345d", claim: "0x379607f5", faucet: "0x57915897", approve: "0x095ea7b3",
   houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77"
@@ -49,8 +50,8 @@ function houseStats(bankroll, reserved, free, sharePrice) {
 async function setup(page, opts) {
   opts = Object.assign({
     ids: [], pos: {}, balance: 0n, allowance: 0n, shares: 0n, owed: 0n,
-    stats: houseStats(0n, 0n, 0n, 0n),
-    cfg: { payoutBps: 19500, minBet: E18, maxBet: 2000n * E18, minDur: 5, maxDur: 300, strikeDelay: 3, settleGrace: 3600, tipBps: 100, maxTip: 5n * E18 }
+    stats: houseStats(1000000n * E18, 0n, 1000000n * E18, 1000000000000n), // funded house so bets pass pre-flight by default
+    cfg: { payoutBps: 19500, minBet: E18, maxBet: 2000n * E18, minDur: 5, maxDur: 300, strikeDelay: 3, settleGrace: 3600, tipBps: 100, maxTip: 5n * E18, maxBetExposureBps: 500, maxAggExposureBps: 3000 }
   }, opts);
   let allowCalls = 0;
   await page.route((url) => url.host.includes("k8s.testnet.json-rpc"), async (route) => {
@@ -71,6 +72,8 @@ async function setup(page, opts) {
       else if (sel === SEL.settleGrace) result = "0x" + u(opts.cfg.settleGrace);
       else if (sel === SEL.tipBps) result = "0x" + u(opts.cfg.tipBps);
       else if (sel === SEL.maxTip) result = "0x" + u(opts.cfg.maxTip);
+      else if (sel === SEL.maxBetExposureBps) result = "0x" + u(opts.cfg.maxBetExposureBps);
+      else if (sel === SEL.maxAggExposureBps) result = "0x" + u(opts.cfg.maxAggExposureBps);
       else if (sel === SEL.positionsOf) result = positionsOf(opts.ids);
       else if (sel === SEL.getPosition) { const gid = Number(lastWord(data)); result = position((opts.byId && opts.byId[gid]) || opts.pos); }
       else if (sel === SEL.owed) { const oid = Number(lastWord(data)); result = "0x" + u(opts.owedById ? (opts.owedById[oid] || 0n) : opts.owed); }
@@ -172,6 +175,18 @@ test("tapping a zone with allowance = a single openBet() tx (no approve)", async
   const txs = await sent(page);
   expect(txs.some((t) => t.sel === SEL.approve)).toBeFalsy();
   expect(txs.find((t) => t.sel === SEL.openBet).to).toBe(BOOK);
+});
+
+test("pre-flight: a bet over the house's per-bet cap is blocked with a precise message (no tx)", async ({ page }) => {
+  // tiny house (100 pts, 5% cap = 5 pts exposure); default 25-stake reserves 23.75 > cap -> blocked before signing
+  await setup(page, { balance: 1000n * E18, allowance: 1n << 255n, stats: houseStats(100n * E18, 0n, 100n * E18, 1000000000000n) });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#phase")).toHaveText(/TAP UP OR DOWN/);
+  await upZoneClick(page);
+  await expect(page.getByText(/Too big for the house/)).toBeVisible();
+  const txs = await sent(page);
+  expect(txs.some((t) => t.sel === SEL.openBet)).toBeFalsy(); // never sent — caught client-side
 });
 
 test("a contract revert maps to a plain-language message (not 'Bet failed')", async ({ page }) => {
