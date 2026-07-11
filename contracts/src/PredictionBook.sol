@@ -476,7 +476,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         bool voidIt
     ) internal {
         uint256 stake = p.stake;
-        uint256 tip = _tip(stake);
+        uint256 tip = _tip(stake, p.payoutBps);
 
         // --- decide outcome (no external calls) ---
         uint256 payout; // owed to the bettor (pull)
@@ -520,12 +520,17 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         if (p.result != Result.Open) revert NotOpen();
         uint64 deadline = p.strikeInstant + p.dur + settleGrace;
         if (block.timestamp < deadline) {
-            // pre-grace: only reachable while paused, and only the bettor may void their own bet
-            if (!paused() || msg.sender != p.bettor) revert GraceNotElapsed();
+            // pre-grace fast path exists only for un-resolvable positions during a pause: paused AND
+            // the bettor's own bet AND NOT yet matured. A matured bet's win/loss is already knowable
+            // (fixed past instants), so allowing a self-void there would let a bettor dodge a known
+            // loss (void refunds stake-tip vs a loss forfeiting the stake) at LP expense — it must
+            // instead go through settle (which works while paused) or the post-grace hatch.
+            bool matured = block.timestamp >= uint256(p.strikeInstant) + p.dur;
+            if (!paused() || msg.sender != p.bettor || matured) revert GraceNotElapsed();
         }
 
         uint256 stake = p.stake;
-        uint256 tip = _tip(stake);
+        uint256 tip = _tip(stake, p.payoutBps);
         uint256 payout = stake - tip;
 
         // EFFECTS before INTERACTIONS
@@ -623,9 +628,16 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     }
 
     // ---- internal ----
-    function _tip(uint256 stake) internal view returns (uint256 t) {
+    /// @dev Settler tip = tipBps of stake, capped by maxTip AND by the bet's OWN snapshot edge.
+    /// The snapshot-edge cap is the load-bearing one: payoutBps is fixed per bet at open, but tipBps
+    /// is global, so an owner lowering payout + raising tip would otherwise push the tip above an
+    /// already-open bet's vig, reopening the matched-pair self-settle drain. Capping at the per-bet
+    /// edge makes tip <= that bet's vig unconditionally, whatever the live params later become.
+    function _tip(uint256 stake, uint256 betPayoutBps) internal view returns (uint256 t) {
         t = (stake * tipBps) / BPS;
         if (t > maxTip) t = maxTip;
+        uint256 edgeCap = (stake * _maxEdgeBps(betPayoutBps)) / BPS;
+        if (t > edgeCap) t = edgeCap;
     }
 
     function _totalFee(bytes[] calldata strikeData, bytes[] calldata closeData)

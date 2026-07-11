@@ -499,4 +499,56 @@ contract PredictionBookTest is Test {
         _settle(betId, 100_000, 100_010, 0, 0);
         assertGe(vault.totalAssets(), vault.reservedExposure(), "solvent after payout");
     }
+
+    // ---- audit re-audit fixes: per-bet tip edge cap + matured-void exclusion ----
+    function test_TipCappedAtSnapshotEdge_afterPayoutLowered() public {
+        // Open a pair at HIGH payout (edge 100bps), then owner lowers payout + raises tip. The
+        // already-open bets' tip must stay capped at THEIR snapshot edge, so a self-settle can't drain.
+        book.setParams(19900, 5000, 5000, MINBET, MAXBET); // payout 1.99x, edge 100bps
+        book.setGuards(0, 100, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
+        address eve = address(0xE7E);
+        token.mint(eve, 1_000_000 ether); vm.deal(eve, 10 ether);
+        vm.prank(eve); token.approve(address(book), type(uint256).max);
+        uint256 S = 1000 ether;
+        uint256 before = token.balanceOf(eve);
+        vm.startPrank(eve);
+        uint256 up = book.openBet(marketId, true, S, 30);
+        uint256 dn = book.openBet(marketId, false, S, 30);
+        vm.stopPrank();
+        // owner reconfigures: lower payout (raises live edge), then raise tip to the new edge
+        book.setParams(15000, 5000, 5000, MINBET, MAXBET); // edge now 5000bps
+        book.setGuards(0, 2000, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE); // tip 20%
+        PredictionBook.Position memory pp = book.getPosition(up);
+        uint64 sAt = pp.strikeInstant; uint64 cAt = sAt + 30; vm.warp(cAt);
+        bytes[] memory sData = _uupd(100e8, 0, sAt, sAt - 1);
+        bytes[] memory cData = _uupd(101e8, 0, cAt, cAt - 1);
+        vm.startPrank(eve);
+        book.settle{value: 2 * FEE}(up, sData, cData);
+        book.settle{value: 2 * FEE}(dn, sData, cData);
+        if (book.owed(up) > 0) book.claim(up);
+        if (book.owed(dn) > 0) book.claim(dn);
+        vm.stopPrank();
+        assertLe(token.balanceOf(eve), before, "tip must be capped at the bet's own snapshot edge");
+    }
+
+    function test_VoidExpired_pausedMaturedLoser_reverts() public {
+        // A matured losing bet cannot be self-voided during a pause to dodge the loss; must settle.
+        uint256 betId = _open(alice, true, 100 ether, 30);
+        PredictionBook.Position memory p = book.getPosition(betId);
+        vm.warp(p.strikeInstant + p.dur); // matured, still within grace
+        book.pause();
+        vm.prank(alice);
+        vm.expectRevert(PredictionBook.GraceNotElapsed.selector);
+        book.voidExpired(betId);
+    }
+
+    function test_VoidExpired_pausedUnmaturedBettor_ok() public {
+        // Genuine self-rescue of an un-resolvable (not matured) position during a pause still works.
+        uint256 betId = _open(alice, true, 100 ether, 30);
+        book.pause(); // still before strikeInstant+dur
+        vm.prank(alice);
+        book.voidExpired(betId);
+        assertEq(uint8(book.getPosition(betId).result), uint8(PredictionBook.Result.Void));
+    }
+
 }
