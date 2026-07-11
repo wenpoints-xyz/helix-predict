@@ -60,6 +60,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     uint256 internal constant BPS = 10000;
     uint256 public constant MAX_PAYOUT_BPS = 19900; // < 2.00x so the house edge stays positive
     uint256 public constant MAX_EXPOSURE_BPS = 5000; // caps can never exceed 50% of the bankroll
+    uint64 public constant MIN_SETTLE_GRACE = 60; // grace floor: keeper always gets >=60s before a void race
 
     IPyth public immutable pyth;
     HouseVault public immutable vault;
@@ -207,6 +208,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         minBet = _minBet;
         maxBet = _maxBet;
         // sane starting guards; owner tunes via setGuards before/after markets are added
+        maxConfBps = 200; // 2% conf band — confidence guard ON from deploy (never leave it 0/disabled)
         tipBps = 100; // 1% of stake
         maxTip = type(uint256).max;
         maxOpenPerUser = 25;
@@ -244,12 +246,22 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
             revert ExposureCapTooHigh();
         }
         if (_minBet == 0 || _maxBet < _minBet) revert BadParams();
+        // Raising payout shrinks the house edge; the standing tip must still be < that edge or a
+        // matched up/down self-settle drains the vault. Re-check the same invariant setGuards enforces.
+        if (tipBps > _maxEdgeBps(_payoutBps)) revert BadParams();
         payoutBps = _payoutBps;
         maxBetExposureBps = _maxBetExposureBps;
         maxAggExposureBps = _maxAggExposureBps;
         minBet = _minBet;
         maxBet = _maxBet;
         emit ParamsSet(_payoutBps, _maxBetExposureBps, _maxAggExposureBps, _minBet, _maxBet);
+    }
+
+    /// @dev The per-bet house edge in bps = 2*BPS - payoutBps (the vig on a matched up+down pair).
+    /// The settler tip must stay <= this, else a same-block up/down self-settle nets a risk-free
+    /// profit (tip income > vig) straight out of LP capital.
+    function _maxEdgeBps(uint256 payout) internal pure returns (uint256) {
+        return 2 * BPS - payout; // payout <= MAX_PAYOUT_BPS (19900) so this is in [100, BPS)
     }
 
     function setGuards(
@@ -263,10 +275,16 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         uint64 _settleTol,
         uint64 _settleGrace
     ) external onlyOwner {
-        // tip must be < the vig, else a settler could self-settle a loss for profit; cap at (m-1)/2.
-        if (_tipBps > (payoutBps - BPS) / 2) revert BadParams();
+        // Tip must be <= the house edge (2*BPS - payoutBps). The old bound (payoutBps-BPS)/2 was
+        // wrong: it caps at half the RESERVATION, but the drain vector is a matched up+down pair
+        // self-settled in one block (identical strike/close -> exactly one win + one loss, no price
+        // risk), where the settler collects the tip on both legs. Profit > 0 iff tip > vig. A zero
+        // tip removes the settle incentive (and can brick settles on zero-reverting tokens), so
+        // require > 0.
+        if (_tipBps == 0 || _tipBps > _maxEdgeBps(payoutBps)) revert BadParams();
         if (_maxOpenPerUser == 0 || _minDur == 0 || _maxDur < _minDur) revert BadParams();
         if (_strikeDelay == 0 || _settleTol == 0) revert BadParams();
+        if (_settleGrace < MIN_SETTLE_GRACE) revert BadParams(); // no void-race window at maturity
         maxConfBps = _maxConfBps;
         tipBps = _tipBps;
         maxTip = _maxTip;
@@ -375,14 +393,20 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     ) external payable nonReentrant {
         uint256 n = betIds.length;
         if (strikeData.length != n || closeData.length != n) revert BadParams();
+        // Budget against msg.value ONLY — never address(this).balance. A griefer can force-send INJ
+        // (selfdestruct) to inflate the balance; if the loop spent past msg.value, the refund below
+        // would underflow and revert the whole batch. Tracking a local msg.value budget keeps
+        // spent <= msg.value, so the refund can never underflow.
+        uint256 budget = msg.value;
         uint256 spent;
         _activeSettler = msg.sender; // routes each self-call's tip back to the original keeper
         for (uint256 i; i < n; i++) {
             uint256 fee = _totalFee(strikeData[i], closeData[i]);
-            if (address(this).balance < fee) break; // out of forwarded value; stop cleanly
+            if (budget < fee) break; // out of forwarded value; stop cleanly
             // external self-call so a single bad bet reverts in isolation (skip-not-revert)
             try this.settleFor{value: fee}(betIds[i], strikeData[i], closeData[i]) {
                 spent += fee;
+                budget -= fee;
             } catch {
                 // not matured / already settled / empty oracle window -> skip
             }
@@ -439,8 +463,10 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         bad = _confTooWide(p);
     }
 
-    /// @dev Money movement: free the reservation first (keeps the vault solvent on pay), tip the
-    /// settler from escrow on every path, then win/loss/void the rest. Bettor proceeds are pull.
+    /// @dev Decide the outcome, write ALL contract state first (checks-effects-interactions), then
+    /// move money: free the reservation, tip the settler from escrow, then win/loss/void the rest.
+    /// Bettor proceeds are pull. CEI ordering + the nonReentrant entry points mean even a hooked
+    /// stake token (the planned USDC/other swap) can't reenter into inconsistent state.
     function _resolve(
         Position storage p,
         uint256 betId,
@@ -450,13 +476,12 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         bool voidIt
     ) internal {
         uint256 stake = p.stake;
-        uint256 tip = _tip(stake);
-        vault.release(p.reserve);
-        p.strike = strike;
-        p.close = close;
-        stakeToken.safeTransfer(settler, tip); // settler paid on every path (win/loss/void)
+        uint256 tip = _tip(stake, p.payoutBps);
 
+        // --- decide outcome (no external calls) ---
         uint256 payout; // owed to the bettor (pull)
+        uint256 vaultPull; // (m−1)·stake to pull from the vault on a win
+        uint256 vaultReturn; // losing stake (minus tip) to send back to LPs
         Result result;
         if (voidIt) {
             result = Result.Void; // tie or untrustworthy price: refund stake − tip, zero house P&L
@@ -464,35 +489,58 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         } else if (p.up ? close > strike : close < strike) {
             result = Result.Win;
             uint256 distributable = (stake * p.payoutBps) / BPS; // m·stake (floored)
-            vault.payWinnings(address(this), distributable - stake); // pull the (m−1)·stake shortfall
+            vaultPull = distributable - stake; // the (m−1)·stake shortfall
             payout = distributable - tip;
         } else {
             result = Result.Loss;
-            stakeToken.safeTransfer(address(vault), stake - tip); // losing stake (minus tip) -> LPs
+            vaultReturn = stake - tip; // losing stake (minus tip) -> LPs
         }
+
+        // --- EFFECTS: all state written before any external call ---
+        p.strike = strike;
+        p.close = close;
         p.result = result;
         owed[betId] = payout;
         openCount[p.bettor] -= 1;
+
+        // --- INTERACTIONS: free reservation first (keeps the vault solvent on pay), then move money ---
+        vault.release(p.reserve);
+        if (tip > 0) stakeToken.safeTransfer(settler, tip); // settler paid on every path
+        if (vaultPull > 0) vault.payWinnings(address(this), vaultPull);
+        if (vaultReturn > 0) stakeToken.safeTransfer(address(vault), vaultReturn);
         emit BetSettled(betId, settler, strike, close, result, payout, tip);
     }
 
-    /// @notice Permissionless refund hatch: if a bet never settles (oracle/keeper down) once past
-    /// grace, OR while the contract is paused, free the escrow + reservation so nothing locks. Pays
-    /// the caller the same tip (incentivise cleanup).
+    /// @notice Refund hatch so nothing locks. After grace (oracle/keeper down) it's permissionless.
+    /// While PAUSED, the pre-grace fast path is restricted to the bettor's OWN self-rescue — otherwise
+    /// a third party could mass-void other people's would-be-winning bets during a pause, denying them
+    /// their upside for a skimmed tip. Pays the caller the same tip (incentivise cleanup / self-rescue).
     function voidExpired(uint256 betId) external nonReentrant {
         Position storage p = positions[betId];
         if (p.result != Result.Open) revert NotOpen();
         uint64 deadline = p.strikeInstant + p.dur + settleGrace;
-        if (block.timestamp < deadline && !paused()) revert GraceNotElapsed();
+        if (block.timestamp < deadline) {
+            // pre-grace fast path exists only for un-resolvable positions during a pause: paused AND
+            // the bettor's own bet AND NOT yet matured. A matured bet's win/loss is already knowable
+            // (fixed past instants), so allowing a self-void there would let a bettor dodge a known
+            // loss (void refunds stake-tip vs a loss forfeiting the stake) at LP expense — it must
+            // instead go through settle (which works while paused) or the post-grace hatch.
+            bool matured = block.timestamp >= uint256(p.strikeInstant) + p.dur;
+            if (!paused() || msg.sender != p.bettor || matured) revert GraceNotElapsed();
+        }
 
         uint256 stake = p.stake;
-        uint256 tip = _tip(stake);
-        vault.release(p.reserve);
+        uint256 tip = _tip(stake, p.payoutBps);
+        uint256 payout = stake - tip;
+
+        // EFFECTS before INTERACTIONS
         p.result = Result.Void;
-        owed[betId] = stake - tip;
+        owed[betId] = payout;
         openCount[p.bettor] -= 1;
-        stakeToken.safeTransfer(msg.sender, tip);
-        emit BetSettled(betId, msg.sender, 0, 0, Result.Void, stake - tip, tip);
+
+        vault.release(p.reserve);
+        if (tip > 0) stakeToken.safeTransfer(msg.sender, tip);
+        emit BetSettled(betId, msg.sender, 0, 0, Result.Void, payout, tip);
     }
 
     /// @notice Pull the bettor's proceeds (winnings or a void refund). No-op paths revert.
@@ -580,9 +628,16 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     }
 
     // ---- internal ----
-    function _tip(uint256 stake) internal view returns (uint256 t) {
+    /// @dev Settler tip = tipBps of stake, capped by maxTip AND by the bet's OWN snapshot edge.
+    /// The snapshot-edge cap is the load-bearing one: payoutBps is fixed per bet at open, but tipBps
+    /// is global, so an owner lowering payout + raising tip would otherwise push the tip above an
+    /// already-open bet's vig, reopening the matched-pair self-settle drain. Capping at the per-bet
+    /// edge makes tip <= that bet's vig unconditionally, whatever the live params later become.
+    function _tip(uint256 stake, uint256 betPayoutBps) internal view returns (uint256 t) {
         t = (stake * tipBps) / BPS;
         if (t > maxTip) t = maxTip;
+        uint256 edgeCap = (stake * _maxEdgeBps(betPayoutBps)) / BPS;
+        if (t > edgeCap) t = edgeCap;
     }
 
     function _totalFee(bytes[] calldata strikeData, bytes[] calldata closeData)

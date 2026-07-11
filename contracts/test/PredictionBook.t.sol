@@ -304,10 +304,30 @@ contract PredictionBookTest is Test {
         book.voidExpired(betId);
     }
 
-    function test_VoidExpired_whenPaused_immediate() public {
+    function test_VoidExpired_whenPaused_bettorSelfRescue() public {
         uint256 betId = _open(alice, true, 100 ether, 30);
         book.pause();
-        book.voidExpired(betId); // allowed immediately while paused
+        vm.prank(alice); // the bettor may self-rescue immediately while paused
+        book.voidExpired(betId);
+        assertEq(uint8(book.getPosition(betId).result), uint8(PredictionBook.Result.Void));
+    }
+
+    function test_VoidExpired_whenPaused_thirdPartyReverts() public {
+        // a non-bettor must NOT be able to force-void someone else's open bet during a pause
+        uint256 betId = _open(alice, true, 100 ether, 30);
+        book.pause();
+        vm.prank(bob);
+        vm.expectRevert(PredictionBook.GraceNotElapsed.selector);
+        book.voidExpired(betId);
+    }
+
+    function test_VoidExpired_afterGrace_permissionless() public {
+        // after grace, anyone (here bob, not the bettor) may void — the liveness hatch is intact
+        uint256 betId = _open(alice, true, 100 ether, 30);
+        PredictionBook.Position memory p = book.getPosition(betId);
+        vm.warp(p.strikeInstant + p.dur + GRACE);
+        vm.prank(bob);
+        book.voidExpired(betId);
         assertEq(uint8(book.getPosition(betId).result), uint8(PredictionBook.Result.Void));
     }
 
@@ -362,11 +382,78 @@ contract PredictionBookTest is Test {
         assertEq(token.balanceOf(address(this)), 2 * ((10 ether * 100) / 10000), "two tips");
     }
 
-    // ---- tip guard ----
-    function test_SetGuards_rejectsTipAboveHalfVig() public {
-        // vig = m-1 = 9500 bps; half = 4750; tip 4800 should revert
+    // ---- tip guard (edge-based: tip <= 2*BPS - payoutBps) ----
+    function test_SetGuards_tipAtEdgeOK_aboveReverts() public {
+        // m = 19500 -> house edge = 2*10000 - 19500 = 500 bps. Tip 500 OK, 501 reverts.
+        book.setGuards(0, 500, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
+        assertEq(book.tipBps(), 500);
         vm.expectRevert(PredictionBook.BadParams.selector);
-        book.setGuards(0, 4800, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
+        book.setGuards(0, 501, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
+    }
+
+    function test_SetGuards_rejectsZeroTip() public {
+        vm.expectRevert(PredictionBook.BadParams.selector);
+        book.setGuards(0, 0, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
+    }
+
+    function test_SetGuards_rejectsGraceBelowFloor() public {
+        vm.expectRevert(PredictionBook.BadParams.selector);
+        book.setGuards(0, 100, type(uint256).max, 25, 5, 300, DELTA, TOL, 59); // < MIN_SETTLE_GRACE (60)
+    }
+
+    function test_SetParams_raisingPayoutRechecksTip() public {
+        // Standing tip 400 is fine at m=19500 (edge 500). Raising payout to 19800 (edge 200) must
+        // revert because the standing tip 400 would exceed the new edge -> drain vector.
+        book.setGuards(0, 400, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
+        vm.expectRevert(PredictionBook.BadParams.selector);
+        book.setParams(19800, 500, 3000, MINBET, MAXBET);
+        // lowering the tip first, then raising payout, is allowed
+        book.setGuards(0, 100, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
+        book.setParams(19800, 500, 3000, MINBET, MAXBET);
+        assertEq(book.payoutBps(), 19800);
+    }
+
+    function test_Constructor_confGuardOnByDefault() public {
+        // a freshly-constructed book must NOT leave the confidence guard disabled (maxConfBps==0)
+        HouseVault v2 = new HouseVault(IERC20(address(token)), "v2", "v2");
+        PredictionBook b2 = new PredictionBook(IPyth(address(pyth)), v2, M, 500, 3000, MINBET, MAXBET);
+        assertGt(b2.maxConfBps(), 0);
+    }
+
+    // The matched-pair self-settle drain the audit found: at safe params it must NOT be profitable.
+    // eve opens up+down in the same block (identical strike/close instants -> exactly one win + one
+    // loss, no price risk) and settles BOTH herself so she collects both tips. With tip <= house edge
+    // her net token balance must not rise.
+    function test_MatchedPairSelfSettle_notProfitable() public {
+        book.setGuards(0, 100, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE); // tip 1% < edge 5%
+        address eve = address(0xE7E);
+        token.mint(eve, 1_000_000 ether);
+        vm.deal(eve, 10 ether);
+        vm.prank(eve);
+        token.approve(address(book), type(uint256).max);
+
+        uint256 stake = 1000 ether;
+        uint256 before = token.balanceOf(eve);
+        vm.startPrank(eve);
+        uint256 up = book.openBet(marketId, true, stake, 30);
+        uint256 dn = book.openBet(marketId, false, stake, 30);
+        vm.stopPrank();
+
+        PredictionBook.Position memory p = book.getPosition(up);
+        uint64 sAt = p.strikeInstant;
+        uint64 cAt = sAt + 30;
+        vm.warp(cAt);
+        // strike 100 @ sAt, close 101 @ cAt -> up wins, down loses; eve is the settler (gets both tips)
+        bytes[] memory sData = _uupd(100e8, 0, sAt, sAt - 1);
+        bytes[] memory cData = _uupd(101e8, 0, cAt, cAt - 1);
+        vm.startPrank(eve);
+        book.settle{value: 2 * FEE}(up, sData, cData);
+        book.settle{value: 2 * FEE}(dn, sData, cData);
+        if (book.owed(up) > 0) book.claim(up);
+        if (book.owed(dn) > 0) book.claim(dn);
+        vm.stopPrank();
+
+        assertLe(token.balanceOf(eve), before, "matched-pair self-settle must not profit");
     }
 
     // ---- paged views ----
@@ -412,4 +499,56 @@ contract PredictionBookTest is Test {
         _settle(betId, 100_000, 100_010, 0, 0);
         assertGe(vault.totalAssets(), vault.reservedExposure(), "solvent after payout");
     }
+
+    // ---- audit re-audit fixes: per-bet tip edge cap + matured-void exclusion ----
+    function test_TipCappedAtSnapshotEdge_afterPayoutLowered() public {
+        // Open a pair at HIGH payout (edge 100bps), then owner lowers payout + raises tip. The
+        // already-open bets' tip must stay capped at THEIR snapshot edge, so a self-settle can't drain.
+        book.setParams(19900, 5000, 5000, MINBET, MAXBET); // payout 1.99x, edge 100bps
+        book.setGuards(0, 100, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
+        address eve = address(0xE7E);
+        token.mint(eve, 1_000_000 ether); vm.deal(eve, 10 ether);
+        vm.prank(eve); token.approve(address(book), type(uint256).max);
+        uint256 S = 1000 ether;
+        uint256 before = token.balanceOf(eve);
+        vm.startPrank(eve);
+        uint256 up = book.openBet(marketId, true, S, 30);
+        uint256 dn = book.openBet(marketId, false, S, 30);
+        vm.stopPrank();
+        // owner reconfigures: lower payout (raises live edge), then raise tip to the new edge
+        book.setParams(15000, 5000, 5000, MINBET, MAXBET); // edge now 5000bps
+        book.setGuards(0, 2000, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE); // tip 20%
+        PredictionBook.Position memory pp = book.getPosition(up);
+        uint64 sAt = pp.strikeInstant; uint64 cAt = sAt + 30; vm.warp(cAt);
+        bytes[] memory sData = _uupd(100e8, 0, sAt, sAt - 1);
+        bytes[] memory cData = _uupd(101e8, 0, cAt, cAt - 1);
+        vm.startPrank(eve);
+        book.settle{value: 2 * FEE}(up, sData, cData);
+        book.settle{value: 2 * FEE}(dn, sData, cData);
+        if (book.owed(up) > 0) book.claim(up);
+        if (book.owed(dn) > 0) book.claim(dn);
+        vm.stopPrank();
+        assertLe(token.balanceOf(eve), before, "tip must be capped at the bet's own snapshot edge");
+    }
+
+    function test_VoidExpired_pausedMaturedLoser_reverts() public {
+        // A matured losing bet cannot be self-voided during a pause to dodge the loss; must settle.
+        uint256 betId = _open(alice, true, 100 ether, 30);
+        PredictionBook.Position memory p = book.getPosition(betId);
+        vm.warp(p.strikeInstant + p.dur); // matured, still within grace
+        book.pause();
+        vm.prank(alice);
+        vm.expectRevert(PredictionBook.GraceNotElapsed.selector);
+        book.voidExpired(betId);
+    }
+
+    function test_VoidExpired_pausedUnmaturedBettor_ok() public {
+        // Genuine self-rescue of an un-resolvable (not matured) position during a pause still works.
+        uint256 betId = _open(alice, true, 100 ether, 30);
+        book.pause(); // still before strikeInstant+dur
+        vm.prank(alice);
+        book.voidExpired(betId);
+        assertEq(uint8(book.getPosition(betId).result), uint8(PredictionBook.Result.Void));
+    }
+
 }
