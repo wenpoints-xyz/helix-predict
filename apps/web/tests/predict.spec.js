@@ -85,14 +85,18 @@ async function setup(page, opts) {
     else if (req.method === "eth_getBalance") result = "0x" + (10n ** 18n).toString(16); // 1 INJ gas
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ jsonrpc: "2.0", id: req.id, result }) });
   });
-  await page.addInitScript(({ ACCT, FEEDS, PT }) => {
+  await page.addInitScript(({ ACCT, FEEDS, PT, REVERT }) => {
     const cbs = {}; window.__sent = [];
     window.ethereum = {
       isMetaMask: true,
       request: async ({ method, params }) => {
         if (method === "eth_requestAccounts" || method === "eth_accounts") return [ACCT];
         if (method === "eth_chainId") return "0x59f";
-        if (method === "eth_sendTransaction") { window.__sent.push(params[0]); return "0x" + "de".repeat(32); }
+        if (method === "eth_sendTransaction") {
+          window.__sent.push(params[0]);
+          if (REVERT) { const er = new Error("execution reverted"); er.code = 3; er.data = REVERT; throw er; }
+          return "0x" + "de".repeat(32);
+        }
         return null;
       },
       on(ev, cb) { cbs[ev] = cb; }
@@ -108,7 +112,7 @@ async function setup(page, opts) {
       }
       close() {}
     };
-  }, { ACCT, FEEDS, PT: opts.pt != null ? opts.pt : null });
+  }, { ACCT, FEEDS, PT: opts.pt != null ? opts.pt : null, REVERT: opts.txRevert || null });
 }
 const sent = (page) => page.evaluate(() => window.__sent.map((t) => ({ to: (t.to || "").toLowerCase(), sel: (t.data || "").slice(0, 10) })));
 async function upZoneClick(page) {
@@ -168,6 +172,16 @@ test("tapping a zone with allowance = a single openBet() tx (no approve)", async
   const txs = await sent(page);
   expect(txs.some((t) => t.sel === SEL.approve)).toBeFalsy();
   expect(txs.find((t) => t.sel === SEL.openBet).to).toBe(BOOK);
+});
+
+test("a contract revert maps to a plain-language message (not 'Bet failed')", async ({ page }) => {
+  // openBet reverts with AggCapExceeded selector -> user sees the human message, not the raw error
+  await setup(page, { balance: 1000n * E18, allowance: 1n << 255n, txRevert: "0x137b0798" });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#phase")).toHaveText(/TAP UP OR DOWN/);
+  await upZoneClick(page);
+  await expect(page.getByText(/The house is full right now/)).toBeVisible();
 });
 
 test("tapping without allowance = approve() then openBet()", async ({ page }) => {
