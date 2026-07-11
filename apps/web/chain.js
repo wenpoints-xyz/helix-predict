@@ -66,6 +66,8 @@
     maxDur: "0xeab50bd2",
     strikeDelay: "0x51fd4c2a",
     settleGrace: "0x12ae6491",
+    tipBps: "0xe79ce788",
+    maxTip: "0x7b45eb36",
     faucet: "0x57915897",        // faucet(uint256)
     approve: "0x095ea7b3",       // approve(address,uint256)
     balanceOf: "0x70a08231",
@@ -180,11 +182,12 @@
   // Batch the config the UI needs (odds, stake bounds, duration bounds) in one go.
   function bookConfig() {
     return Promise.all([
-      _param(SEL.payoutBps), _param(SEL.minBet), _param(SEL.maxBet), _param(SEL.minDur), _param(SEL.maxDur), _param(SEL.strikeDelay), _param(SEL.settleGrace)
+      _param(SEL.payoutBps), _param(SEL.minBet), _param(SEL.maxBet), _param(SEL.minDur), _param(SEL.maxDur), _param(SEL.strikeDelay), _param(SEL.settleGrace), _param(SEL.tipBps), _param(SEL.maxTip)
     ]).then(function (r) {
       return {
         payoutBps: Number(r[0]), minBet: r[1], maxBet: r[2],
-        minDur: Number(r[3]), maxDur: Number(r[4]), strikeDelay: Number(r[5]), settleGrace: Number(r[6])
+        minDur: Number(r[3]), maxDur: Number(r[4]), strikeDelay: Number(r[5]), settleGrace: Number(r[6]),
+        tipBps: Number(r[7]), maxTip: r[8]
       };
     });
   }

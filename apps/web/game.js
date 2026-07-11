@@ -26,7 +26,7 @@
     dur: parseInt(localStorage.predict_dur || "15", 10) || 15,
     bal: null, acct: null, cfg: null, markets: {},
     feeds: {}, active: {}, myBets: [], seen: {}, claiming: {}, pendingOpen: {}, provStrike: {}, finishT: {}, hist: {},
-    pending: null, owedZero: {},
+    pending: null, owedZero: {}, statsBets: null, statWin: 3,
     muted: localStorage.predict_mute === "1",
     hover: null, press: null, flash: null,
     feedMode: "live", lastAnyTick: Date.now()
@@ -39,7 +39,7 @@
   var wrap = $("chartwrap");
   var el = { rid: $("rid"), phase: $("phase"), clock: $("clock"), bal: $("bal"), hist: $("hist"),
              led: $("led"), px: $("px"), feedlbl: $("feedlbl"), getpts: $("getpts"),
-             connect: $("connect"), netbanner: $("netbanner"), dur: $("durbtn"), histbtn: $("histbtn"),
+             connect: $("connect"), netbanner: $("netbanner"), dur: $("durbtn"), histbtn: $("histbtn"), statsbtn: $("statsbtn"),
              pending: $("pending"), pendingMsg: $("pendingMsg"), pendingBtn: $("pendingBtn"),
              lp: $("lp"), lpToggle: $("lpToggle"), lpBank: $("lpBank"), lpMine: $("lpMine"),
              lpUtil: $("lpUtil"), lpAmt: $("lpAmt"), lpDep: $("lpDep"), lpWd: $("lpWd"), lpMsg: $("lpMsg") };
@@ -580,6 +580,94 @@
     });
   }
   el.histbtn.onclick = showHistory;
+
+  /* ---------- MY STATS (🏆 modal): personal P&L from positionsOf, no backend ---------- */
+  // net P&L per bet reconstructed from the Position (the struct has result+stake+payoutBps but not
+  // payout/tip). tip = min(maxTip, stake*tipBps/BPS). Matches on-chain: win (m-1)stake-tip, loss
+  // -stake, void -tip. Windowed by closeInstant = strikeInstant+dur (the moment the bet resolved).
+  var STAT_WINS = [["DAY", 86400], ["WEEK", 604800], ["MONTH", 2592000], ["ALL", 0]];
+  function statTip(stakeWei) {
+    var bps = BigInt(S.cfg ? S.cfg.tipBps : 100), mx = S.cfg ? S.cfg.maxTip : 5n * (10n ** 18n);
+    var t = stakeWei * bps / 10000n; return t > mx ? mx : t;
+  }
+  function betNet(p) { // wei, BigInt (can be negative)
+    if (p.result === PX.RESULT.WIN) return p.stake * BigInt(p.payoutBps) / 10000n - statTip(p.stake) - p.stake;
+    if (p.result === PX.RESULT.LOSS) return -p.stake;
+    if (p.result === PX.RESULT.VOID) return -statTip(p.stake);
+    return 0n; // open — no settled outcome
+  }
+  function computeStats(bets, winSec) {
+    var now = Math.floor(Date.now() / 1000);
+    var net = 0n, vol = 0n, w = 0, l = 0, v = 0, biggest = 0n, streak = 0;
+    bets.forEach(function (p) {
+      var closeAt = p.strikeInstant + p.dur;
+      if (winSec > 0 && closeAt < now - winSec) return; // outside the rolling window
+      vol += p.stake;
+      if (p.result === PX.RESULT.OPEN) return;
+      net += betNet(p);
+      if (p.result === PX.RESULT.WIN) { w++; var n = betNet(p); if (n > biggest) biggest = n; }
+      else if (p.result === PX.RESULT.LOSS) l++;
+      else if (p.result === PX.RESULT.VOID) v++;
+    });
+    for (var i = 0; i < bets.length; i++) { // current streak = leading wins over ALL settled (newest first)
+      if (bets[i].result === PX.RESULT.OPEN) continue;
+      if (bets[i].result === PX.RESULT.WIN) streak++; else break;
+    }
+    return { net: net, vol: vol, w: w, l: l, v: v, biggest: biggest, streak: streak, total: w + l + v };
+  }
+  function signedChips(wei) { var s = wei < 0n ? "-" : "+"; var a = wei < 0n ? -wei : wei; return s + Math.floor(PX.toChips(a)).toLocaleString("en-US"); }
+  function showStats() {
+    var ov = document.createElement("div"); ov.id = "statsmodal";
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(6,11,22,.82);display:flex;align-items:center;justify-content:center;z-index:9998;padding:16px";
+    var box = document.createElement("div");
+    box.style.cssText = "background:var(--panel);border:3px solid;border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt);min-width:300px;max-width:min(96vw,460px);display:flex;flex-direction:column";
+    var hd = document.createElement("div");
+    hd.style.cssText = "display:flex;align-items:center;gap:8px;padding:7px 10px;color:#fff;background:linear-gradient(90deg,var(--stripe-b),var(--stripe-a))";
+    hd.innerHTML = "<span style='flex:1;font-family:var(--comic);font-weight:bold'>🏆 MY STATS</span>";
+    var x = document.createElement("button"); x.className = "tbtn"; x.textContent = "×"; x.onclick = function () { document.body.removeChild(ov); };
+    hd.appendChild(x); box.appendChild(hd);
+    var tabs = document.createElement("div"); tabs.style.cssText = "display:flex;gap:4px;padding:6px 8px";
+    var body = document.createElement("div"); body.style.cssText = "padding:10px 12px 14px;font-family:var(--mono);font-size:13px";
+    box.appendChild(tabs); box.appendChild(body);
+    function drawTabs() {
+      tabs.innerHTML = "";
+      STAT_WINS.forEach(function (wn, i) {
+        var b = document.createElement("button"); b.className = "chip"; b.style.cssText = "flex:1;width:auto;padding:6px 0;font-size:12px";
+        b.textContent = wn[0]; b.setAttribute("aria-pressed", i === S.statWin ? "true" : "false");
+        b.onclick = function () { S.statWin = i; drawTabs(); render(); };
+        tabs.appendChild(b);
+      });
+    }
+    function statRow(a, b) {
+      return "<div style='display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid var(--bevel-dk)'>" +
+        "<span style='opacity:.75'>" + a[0] + "</span><b style='color:" + (a[2] || "var(--ink)") + "'>" + a[1] + "</b>" +
+        "<span style='opacity:.75;margin-left:14px'>" + b[0] + "</span><b style='color:" + (b[2] || "var(--ink)") + "'>" + b[1] + "</b></div>";
+    }
+    function render() {
+      if (!S.acct) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:14px'>Connect a wallet to see your stats.</div>"; return; }
+      if (S.statsBets == null) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:14px'>crunching your bets…</div>"; return; }
+      if (!S.statsBets.length) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:16px'>No bets yet — tap UP or DOWN to play 🏆</div>"; return; }
+      var s = computeStats(S.statsBets, STAT_WINS[S.statWin][1]);
+      var col = s.net < 0n ? "var(--bad)" : s.net > 0n ? "var(--ok)" : "var(--ink)";
+      var wr = (s.w + s.l) > 0 ? Math.round(100 * s.w / (s.w + s.l)) : 0;
+      var streakTxt = (s.streak >= 2 ? "🔥 " : "") + s.streak;
+      body.innerHTML =
+        "<div style='text-align:center;margin-bottom:8px'>" +
+          "<div style='font-size:11px;opacity:.6;letter-spacing:1px'>NET P&L</div>" +
+          "<div style='font-size:30px;font-weight:bold;color:" + col + "'>" + signedChips(s.net) + "<span style='font-size:13px;opacity:.6'> pts</span></div>" +
+        "</div>" +
+        statRow(["win rate", wr + "%"], ["record", s.w + "W " + s.l + "L " + s.v + "V"]) +
+        statRow(["volume", Math.floor(PX.toChips(s.vol)).toLocaleString("en-US")], ["biggest hit", s.biggest > 0n ? "+" + Math.floor(PX.toChips(s.biggest)).toLocaleString("en-US") : "—", "var(--ok)"]) +
+        statRow(["streak", streakTxt], ["bets", String(s.total + (s.total !== S.statsBets.length ? "" : ""))]) +
+        (S.statsBets.length >= 150 ? "<div style='opacity:.5;font-size:10px;text-align:center;margin-top:8px'>last 150 bets</div>" : "");
+    }
+    S.statsBets = null; drawTabs(); render();
+    if (S.acct) PX.myPositions(S.acct, 150).then(function (r) { S.statsBets = r.positions; render(); }).catch(function () { S.statsBets = []; render(); });
+    ov.appendChild(box);
+    ov.onclick = function (e) { if (e.target === ov) document.body.removeChild(ov); };
+    document.body.appendChild(ov);
+  }
+  el.statsbtn.onclick = showStats;
 
   /* ---------- flying points ---------- */
   function flyPoints(text, color, side) {
