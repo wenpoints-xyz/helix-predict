@@ -19,7 +19,8 @@ const SEL = {
   marketsLength: "0xa5402544", markets: "0xb1283e77",
   payoutBps: "0x020f09b7", minBet: "0x9619367d", maxBet: "0x2e5b2168",
   minDur: "0x67b38200", maxDur: "0xeab50bd2", strikeDelay: "0x51fd4c2a",
-  positionsOf: "0xdc9d54ef", getPosition: "0xeb02c301", owed: "0xb1276604",
+  positionsOf: "0xdc9d54ef", getPosition: "0xeb02c301", owed: "0xb1276604", settleGrace: "0x12ae6491",
+  voidExpired: "0xb04fe3fa",
   balanceOf: "0x70a08231", allowance: "0xdd62ed3e",
   openBet: "0x058a345d", claim: "0x379607f5", faucet: "0x57915897", approve: "0x095ea7b3",
   houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77"
@@ -49,7 +50,7 @@ async function setup(page, opts) {
   opts = Object.assign({
     ids: [], pos: {}, balance: 0n, allowance: 0n, shares: 0n, owed: 0n,
     stats: houseStats(0n, 0n, 0n, 0n),
-    cfg: { payoutBps: 19500, minBet: E18, maxBet: 2000n * E18, minDur: 5, maxDur: 300, strikeDelay: 3 }
+    cfg: { payoutBps: 19500, minBet: E18, maxBet: 2000n * E18, minDur: 5, maxDur: 300, strikeDelay: 3, settleGrace: 3600 }
   }, opts);
   let allowCalls = 0;
   await page.route((url) => url.host.includes("k8s.testnet.json-rpc"), async (route) => {
@@ -67,6 +68,7 @@ async function setup(page, opts) {
       else if (sel === SEL.minDur) result = "0x" + u(opts.cfg.minDur);
       else if (sel === SEL.maxDur) result = "0x" + u(opts.cfg.maxDur);
       else if (sel === SEL.strikeDelay) result = "0x" + u(opts.cfg.strikeDelay);
+      else if (sel === SEL.settleGrace) result = "0x" + u(opts.cfg.settleGrace);
       else if (sel === SEL.positionsOf) result = positionsOf(opts.ids);
       else if (sel === SEL.getPosition) result = position(opts.pos);
       else if (sel === SEL.owed) result = "0x" + u(opts.owed);
@@ -205,6 +207,48 @@ test("strike shows LOCKING… (not a jumpy number) until the exact tick confirms
   await page.click("#connect");
   await expect(page.locator("#rid")).toHaveText("BET #8");
   await expect(page.locator("#phase")).toHaveText(/LOCKING…/);
+});
+
+test("pending strip: a matured open bet shows 'settling…'", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, {
+    ids: [3],
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 0, stake: 25n * E18, reserve: 24n * E18, strikeInstant: now - 40, dur: 15 } // closed 25s ago, within grace
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#pending")).toBeVisible();
+  await expect(page.locator("#pendingMsg")).toHaveText(/settling/);
+});
+
+test("pending strip: unclaimed winnings show CLAIM and fire claim()", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, {
+    ids: [6], owed: 195n * E18,
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, strikeInstant: now - 60, dur: 15, strike: 100, close: 200 } // WIN, owed 195
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#pendingMsg")).toHaveText(/ready to claim/);
+  await page.click("#pendingBtn");
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.claim);
+  const txs = await sent(page);
+  expect(txs.find((t) => t.sel === SEL.claim).to).toBe(BOOK);
+});
+
+test("pending strip: a bet past grace shows REFUND and fires voidExpired()", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, {
+    ids: [7],
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 0, stake: 25n * E18, reserve: 24n * E18, strikeInstant: now - 5000, dur: 15 } // closed >1h ago (past grace)
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#pendingMsg")).toHaveText(/stuck/);
+  await page.click("#pendingBtn");
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.voidExpired);
+  const txs = await sent(page);
+  expect(txs.find((t) => t.sel === SEL.voidExpired).to).toBe(BOOK);
 });
 
 test("LP panel: shows bankroll from houseStats and deposits to the vault", async ({ page }) => {
