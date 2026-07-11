@@ -177,6 +177,23 @@ test("tapping a zone with allowance = a single openBet() tx (no approve)", async
   expect(txs.find((t) => t.sel === SEL.openBet).to).toBe(BOOK);
 });
 
+test("MAX stake is clamped to the house's per-bet cap, not just balance", async ({ page }) => {
+  // house 19,000 LP, 5% cap, 1.95x -> max bet = 19000*0.05/0.95 = 1,000 pts; balance is huge
+  await setup(page, { balance: 1000000n * E18, allowance: 1n << 255n, stats: houseStats(19000n * E18, 0n, 19000n * E18, 1000000000000n) });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#phase")).toHaveText(/TAP UP OR DOWN/);
+  await page.click('.chip[data-v="max"]');
+  await page.waitForTimeout(400); // let a poll cache S.house
+  await upZoneClick(page);
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.openBet);
+  const stake = await page.evaluate((s) => {
+    const t = window.__sent.find((x) => (x.data || "").startsWith(s));
+    return BigInt("0x" + t.data.slice(10 + 128, 10 + 192)).toString(); // 3rd arg = stake
+  }, SEL.openBet);
+  expect(stake).toBe((1000n * (10n ** 18n)).toString()); // clamped to 1,000, not the 1,000,000 balance
+});
+
 test("pre-flight: a bet over the house's per-bet cap is blocked with a precise message (no tx)", async ({ page }) => {
   // tiny house (100 pts, 5% cap = 5 pts exposure); default 25-stake reserves 23.75 > cap -> blocked before signing
   await setup(page, { balance: 1000n * E18, allowance: 1n << 255n, stats: houseStats(100n * E18, 0n, 100n * E18, 1000000000000n) });

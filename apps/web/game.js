@@ -26,7 +26,7 @@
     dur: parseInt(localStorage.predict_dur || "15", 10) || 15,
     bal: null, acct: null, cfg: null, markets: {},
     feeds: {}, active: {}, myBets: [], seen: {}, claiming: {}, pendingOpen: {}, provStrike: {}, finishT: {}, hist: {},
-    pending: null, owedZero: {}, statsBets: null, statWin: 3,
+    pending: null, owedZero: {}, statsBets: null, statWin: 3, house: null,
     muted: localStorage.predict_mute === "1",
     hover: null, press: null, flash: null,
     feedMode: "live", lastAnyTick: Date.now()
@@ -224,7 +224,11 @@
         assets.forEach(function (a) { S.active[a] = newestOpen[a] || null; });
         computePending();
       });
-    }).catch(function () {}).then(function () { if (S.acct) refreshBalance(); refreshLp(); });
+    }).catch(function () {}).then(function () {
+      if (S.acct) refreshBalance();
+      refreshLp();
+      PX.houseStats().then(function (h) { S.house = h; }).catch(function () {}); // cache bankroll for the MAX chip clamp
+    });
   }
 
   /* ---------- pending / hanging bets (settling, stuck, unclaimed) ---------- */
@@ -436,9 +440,15 @@
 
   /* ---------- betting (open a position) ---------- */
   // MAX = your balance, capped by the contract's maxBet (so it never opens a doomed over-cap bet).
+  // MAX = the largest you can actually bet: the lower of your balance, the absolute maxBet, AND the
+  // biggest bet the house will currently accept (its per-bet exposure cap on the live bankroll).
   function stakeValue() {
     if (S.stake !== "max") return S.stake;
     var cap = S.cfg && S.cfg.maxBet ? PX.toChips(S.cfg.maxBet) : CHIPS_MAX_CAP;
+    if (S.house && S.cfg && S.cfg.maxBetExposureBps && S.cfg.payoutBps > 10000) {
+      var houseMax = PX.toChips(S.house.bankroll) * S.cfg.maxBetExposureBps / (S.cfg.payoutBps - 10000);
+      if (houseMax < cap) cap = houseMax;
+    }
     return Math.max(0, Math.floor(Math.min(S.bal || 0, cap)));
   }
   function placeBet(side) {

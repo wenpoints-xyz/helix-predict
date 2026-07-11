@@ -34,7 +34,7 @@
       faucet: false,       // NO faucet — HELIXPOINT is real; users buy it (see buyUrl)
       buyUrl: "https://pump.trippyinj.xyz/launch/8",
       stakeSymbol: "$HELIXPOINT",
-      chips: [100000, 500000, 1000000, 10000000] // stake presets ($HELIXPOINT scale): 100K/500K/1M/10M
+      chips: [1000, 5000, 10000, 100000] // stake presets ($HELIXPOINT scale): 1K/5K/10K/100K
     }
   };
   function pickNet() {
