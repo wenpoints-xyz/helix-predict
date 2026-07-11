@@ -42,6 +42,7 @@
   var SEL = {
     openBet: "0x058a345d",       // openBet(uint256 marketId,bool up,uint256 stake,uint64 dur)
     claim: "0x379607f5",         // claim(uint256 betId)
+    voidExpired: "0xb04fe3fa",   // voidExpired(uint256 betId) — refund hatch past grace / while paused
     positionsOf: "0xdc9d54ef",   // positionsOf(address,uint256 start,uint256 count) -> (uint256[] ids,uint256 total)
     getPosition: "0xeb02c301",   // getPosition(uint256) -> Position
     positionsLength: "0xd6887bfa",
@@ -55,6 +56,7 @@
     minDur: "0x67b38200",
     maxDur: "0xeab50bd2",
     strikeDelay: "0x51fd4c2a",
+    settleGrace: "0x12ae6491",
     faucet: "0x57915897",        // faucet(uint256)
     approve: "0x095ea7b3",       // approve(address,uint256)
     balanceOf: "0x70a08231",
@@ -161,11 +163,11 @@
   // Batch the config the UI needs (odds, stake bounds, duration bounds) in one go.
   function bookConfig() {
     return Promise.all([
-      _param(SEL.payoutBps), _param(SEL.minBet), _param(SEL.maxBet), _param(SEL.minDur), _param(SEL.maxDur), _param(SEL.strikeDelay)
+      _param(SEL.payoutBps), _param(SEL.minBet), _param(SEL.maxBet), _param(SEL.minDur), _param(SEL.maxDur), _param(SEL.strikeDelay), _param(SEL.settleGrace)
     ]).then(function (r) {
       return {
         payoutBps: Number(r[0]), minBet: r[1], maxBet: r[2],
-        minDur: Number(r[3]), maxDur: Number(r[4]), strikeDelay: Number(r[5])
+        minDur: Number(r[3]), maxDur: Number(r[4]), strikeDelay: Number(r[5]), settleGrace: Number(r[6])
       };
     });
   }
@@ -187,6 +189,7 @@
     return tx(provider, from, NET.book, SEL.openBet + u256(marketId) + bool32(up) + u256(stakeWei) + u256(dur));
   }
   function claim(provider, from, betId) { return tx(provider, from, NET.book, SEL.claim + u256(betId)); }
+  function voidExpired(provider, from, betId) { return tx(provider, from, NET.book, SEL.voidExpired + u256(betId)); }
   function faucet(provider, from, amountWei) { return tx(provider, from, NET.points, SEL.faucet + u256(amountWei)); }
   function approve(provider, from, spender, amountWei) { return tx(provider, from, NET.points, SEL.approve + addr32(spender) + u256(amountWei)); }
   // LP: deposit points into the vault -> shares; withdraw points back out. approve points to NET.vault first.
@@ -298,7 +301,7 @@
     myPositions: myPositions, getPosition: getPosition, positionsLength: positionsLength, owed: owed, reserveFor: reserveFor,
     balanceOf: balanceOf, allowance: allowance, nativeBalance: nativeBalance,
     houseStats: houseStats, vaultShares: vaultShares, vaultMaxWithdraw: vaultMaxWithdraw,
-    openBet: openBet, claim: claim, faucet: faucet, approve: approve,
+    openBet: openBet, claim: claim, voidExpired: voidExpired, faucet: faucet, approve: approve,
     vaultDeposit: vaultDeposit, vaultWithdraw: vaultWithdraw,
     payout: payout, potentialWin: potentialWin, toChips: toChips, chipsToWei: chipsToWei,
     explorerAddr: function (a) { return NET.explorer + "/address/" + a; },

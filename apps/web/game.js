@@ -26,6 +26,7 @@
     dur: parseInt(localStorage.predict_dur || "15", 10) || 15,
     bal: null, acct: null, cfg: null, markets: {},
     feeds: {}, active: {}, myBets: [], seen: {}, claiming: {}, pendingOpen: {}, provStrike: {}, finishT: {}, hist: {},
+    pending: null, owedZero: {},
     muted: localStorage.predict_mute === "1",
     hover: null, press: null, flash: null,
     feedMode: "live", lastAnyTick: Date.now()
@@ -39,6 +40,7 @@
   var el = { rid: $("rid"), phase: $("phase"), clock: $("clock"), bal: $("bal"), hist: $("hist"),
              led: $("led"), px: $("px"), feedlbl: $("feedlbl"), getpts: $("getpts"),
              connect: $("connect"), netbanner: $("netbanner"), dur: $("durbtn"),
+             pending: $("pending"), pendingMsg: $("pendingMsg"), pendingBtn: $("pendingBtn"),
              lp: $("lp"), lpToggle: $("lpToggle"), lpBank: $("lpBank"), lpMine: $("lpMine"),
              lpUtil: $("lpUtil"), lpAmt: $("lpAmt"), lpDep: $("lpDep"), lpWd: $("lpWd"), lpMsg: $("lpMsg") };
 
@@ -220,9 +222,70 @@
           }
         });
         assets.forEach(function (a) { S.active[a] = newestOpen[a] || null; });
+        computePending();
       });
     }).catch(function () {}).then(function () { if (S.acct) refreshBalance(); refreshLp(); });
   }
+
+  /* ---------- pending / hanging bets (settling, stuck, unclaimed) ---------- */
+  // Surfaces bets that need attention even if you lost connection or the keeper is behind:
+  //   • matured + Open           -> "settling" (the keeper is on it; usually seconds)
+  //   • matured + Open past grace -> "stuck"    -> REFUND (voidExpired, no oracle needed)
+  //   • settled Win/Void, owed>0  -> "unclaimed" -> CLAIM  (a failed/rejected auto-claim landed here)
+  function computePending() {
+    var now = Date.now(), grace = (S.cfg && S.cfg.settleGrace ? S.cfg.settleGrace : 3600) * 1000;
+    var settling = 0, refundable = [], winVoid = [];
+    S.myBets.forEach(function (p) {
+      var closeMs = (p.strikeInstant + p.dur) * 1000;
+      if (p.result === PX.RESULT.OPEN) {
+        if (now >= closeMs + grace) refundable.push(p.betId);
+        else if (now >= closeMs) settling++;
+      } else if (p.result === PX.RESULT.WIN || p.result === PX.RESULT.VOID) {
+        winVoid.push(p.betId); // owed>0 only if a claim never landed
+      }
+    });
+    // read owed only for a bounded set of recent settled Win/Void bets (usually 0 after auto-claim)
+    var check = winVoid.slice(0, 12).filter(function (id) { return !S.owedZero[id]; });
+    Promise.all(check.map(function (id) {
+      return PX.owed(id).then(function (w) { if (w <= 0n) S.owedZero[id] = true; return { id: id, owed: w }; }).catch(function () { return { id: id, owed: 0n }; });
+    })).then(function (res) {
+      var unclaimed = res.filter(function (x) { return x.owed > 0n; });
+      var total = unclaimed.reduce(function (s, x) { return s + x.owed; }, 0n);
+      S.pending = { settling: settling, refundable: refundable, unclaimed: unclaimed.map(function (x) { return x.id; }), unclaimedTotal: total };
+      renderPending();
+    });
+  }
+  function renderPending() {
+    var pg = S.pending || {}, msg = "", btn = null, act = null;
+    if (pg.unclaimedTotal && pg.unclaimedTotal > 0n) {
+      msg = "🏆 " + Math.floor(PX.toChips(pg.unclaimedTotal)).toLocaleString("en-US") + " pts ready to claim";
+      btn = "CLAIM"; act = "claim";
+    } else if (pg.refundable && pg.refundable.length) {
+      msg = "⚠ " + pg.refundable.length + " stuck bet" + (pg.refundable.length > 1 ? "s" : "") + " — settlement lapsed";
+      btn = "REFUND"; act = "refund";
+    } else if (pg.settling) {
+      msg = "⏳ " + pg.settling + " bet" + (pg.settling > 1 ? "s" : "") + " settling…";
+    }
+    if (!msg || !S.acct) { el.pending.style.display = "none"; return; }
+    el.pending.style.display = "flex";
+    el.pendingMsg.textContent = msg;
+    el.pending.style.borderColor = act === "refund" ? PAL.bad : PAL.accent;
+    if (btn) { el.pendingBtn.hidden = false; el.pendingBtn.textContent = btn; el.pendingBtn.dataset.act = act; }
+    else el.pendingBtn.hidden = true;
+  }
+  el.pendingBtn.onclick = function () {
+    if (!S.acct) return;
+    var pg = S.pending || {}, act = el.pendingBtn.dataset.act;
+    var ids = act === "claim" ? (pg.unclaimed || []) : act === "refund" ? (pg.refundable || []) : [];
+    if (!ids.length) return;
+    var fn = act === "claim" ? PX.claim : PX.voidExpired;
+    el.pendingBtn.hidden = true; // debounce
+    toast(act === "claim" ? "Claiming — confirm in wallet." : "Refunding stuck bet — confirm in wallet.");
+    // fire them sequentially-ish; each is its own wallet confirm
+    ids.reduce(function (chain, id) {
+      return chain.then(function () { return fn(PX.wallet.provider, S.acct, id).catch(function () {}); });
+    }, Promise.resolve()).then(function () { setTimeout(poll, 2500); }).catch(function (e) { toast(txErr(e, "Failed — try again.")); });
+  };
   function assetOf(marketId) {
     for (var a in S.markets) if (S.markets[a] === marketId) return a;
     return null;
@@ -307,7 +370,7 @@
   }
   PX.wallet.onChange(function (w) {
     S.acct = w.account; refreshConnectBtn(); checkNet();
-    if (S.acct) { poll(); checkGas(); } else { S.bal = null; S.myBets = []; assets.forEach(function (a) { S.active[a] = null; }); updateBalance(); }
+    if (S.acct) { poll(); checkGas(); } else { S.bal = null; S.myBets = []; S.pending = null; assets.forEach(function (a) { S.active[a] = null; }); updateBalance(); if (el.pending) el.pending.style.display = "none"; }
   });
 
   /* ---------- toast ---------- */
