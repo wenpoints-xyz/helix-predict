@@ -87,13 +87,19 @@ contract PredictionBookTest is Test {
         betId = book.openBet(marketId, up, stake, dur);
     }
 
-    function _uupd(int64 price, uint64 conf, uint64 pt, uint64 prevPt) internal view returns (bytes[] memory d) {
+    function _uupd(int64 price, uint64 conf, uint64 pt, uint64 prevPt)
+        internal
+        view
+        returns (bytes[] memory d)
+    {
         d = new bytes[](1);
         d[0] = pyth.createUniqueUpdateData(FEED, price, conf, -8, pt, prevPt);
     }
 
     /// @dev Settle a matured bet with honest first-tick updates at both instants.
-    function _settle(uint256 betId, int64 strikePrice, int64 closePrice, uint64 sConf, uint64 cConf) internal {
+    function _settle(uint256 betId, int64 strikePrice, int64 closePrice, uint64 sConf, uint64 cConf)
+        internal
+    {
         PredictionBook.Position memory p = book.getPosition(betId);
         uint64 sAt = p.strikeInstant;
         uint64 cAt = sAt + p.dur;

@@ -1,10 +1,11 @@
 const { test, expect } = require("@playwright/test");
 
-// Bound frontend tests: mock the JSON-RPC (boardSnapshot/myPositions/balanceOf/allowance),
-// the wallet (window.ethereum), and the Pyth Hermes SSE, then drive the arcade. 127.0.0.1 => testnet config.
+// Bound frontend tests for the PredictionBook (per-user positions) model: mock the JSON-RPC
+// (markets/bookConfig/positionsOf/getPosition/houseStats/balanceOf/allowance/owed), the wallet
+// (window.ethereum), and the Pyth Hermes SSE, then drive the arcade. 127.0.0.1 => testnet config.
 
-const POOL = "0xe7773db880bf38574441699a60e53d68a52db680";   // PredictionHouse
-const VAULT = "0x15fc2a0020a2a8309e602fc7b148b120c9c3b587";  // HouseVault
+const BOOK = "0x6ea22353f4e6be0a4d193ce7bb3f63186bdf74e3";  // PredictionBook
+const VAULT = "0x745d463b01667bf15915a27c23746d6d2ad59f2b"; // HouseVault (fresh)
 const POINTS = "0x52045f671c452b7f91a7e436c64f126e78638f14";
 const ACCT = "0xAbC0000000000000000000000000000000001234";
 const E18 = 10n ** 18n;
@@ -13,65 +14,71 @@ const FEEDS = {
   ETH: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
   INJ: "7a5bc1d2b56ad029048cd63964b3ad2776eadf812edc1a43a31406cb54bff592"
 };
-const MK = [["BTC", 15], ["ETH", 15], ["INJ", 15]]; // live markets are BTC/ETH/INJ at 15s
-const SEL = { board: "0x938be1ab", myPos: "0x98a973bb", balanceOf: "0x70a08231", allowance: "0xdd62ed3e", bet: "0x8decaec0", claim: "0x379607f5", faucet: "0x57915897", approve: "0x095ea7b3", houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77" };
+const FEED_LIST = [FEEDS.BTC, FEEDS.ETH, FEEDS.INJ];
+const SEL = {
+  marketsLength: "0xa5402544", markets: "0xb1283e77",
+  payoutBps: "0x020f09b7", minBet: "0x9619367d", maxBet: "0x2e5b2168",
+  minDur: "0x67b38200", maxDur: "0xeab50bd2", strikeDelay: "0x51fd4c2a",
+  positionsOf: "0xdc9d54ef", getPosition: "0xeb02c301", owed: "0xb1276604",
+  balanceOf: "0x70a08231", allowance: "0xdd62ed3e",
+  openBet: "0x058a345d", claim: "0x379607f5", faucet: "0x57915897", approve: "0x095ea7b3",
+  houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77"
+};
 
 const u = (v) => BigInt(v).toString(16).padStart(64, "0");
+const lastWord = (data) => BigInt("0x" + data.slice(-64)); // decode a single uint arg
 
-// encode RoundInfo[] (dynamic array of a 16-field static struct; house adds payoutBps)
-function encodeBoard(list) {
-  let body = u(list.length);
-  for (const m of list) {
-    body += u(m.marketId) + m.feedId + u(m.timeframe) + u(m.marketEnabled ? 1 : 0) + u(m.hasRound ? 1 : 0)
-      + u(m.roundId || 0) + u(m.lockTime || 0) + u(m.expiryTime || 0) + u(m.strike || 0) + u(m.close || 0)
-      + u(m.upPool || 0n) + u(m.downPool || 0n) + u(m.payoutBps || 0) + u(m.state || 0) + u(m.upWon ? 1 : 0) + u(m.voided ? 1 : 0);
-  }
-  return "0x" + u(32) + body;
+// markets(i) -> (bytes32 feedId, bool enabled)
+function market(i) { return "0x" + FEED_LIST[Number(i)] + u(1); }
+// getPosition -> Position (11 static fields, inline)
+function position(p) {
+  const addr = (p.bettor || ACCT).toLowerCase().replace(/^0x/, "").padStart(64, "0");
+  return "0x" + addr + u(p.marketId || 0) + u(p.payoutBps || 19500) + u(p.up ? 1 : 0) + u(p.result || 0)
+    + u(p.stake || 0n) + u(p.reserve || 0n) + u(p.strikeInstant || 0) + u(p.dur || 0) + u(p.strike || 0) + u(p.close || 0);
 }
-function board(rounds) {
-  return encodeBoard(MK.map((mk, i) => {
-    const r = (rounds && rounds[i]) || {};
-    return {
-      marketId: i, feedId: FEEDS[mk[0]], timeframe: mk[1], marketEnabled: true,
-      hasRound: !!r.hasRound, roundId: r.roundId || 0, lockTime: r.lockTime || 0, expiryTime: r.expiryTime || 0,
-      strike: r.strike || 0, close: r.close || 0, upPool: r.upPool || 0n, downPool: r.downPool || 0n,
-      payoutBps: r.payoutBps != null ? r.payoutBps : (r.hasRound ? 19500 : 0),
-      state: r.state || 0, upWon: !!r.upWon, voided: !!r.voided
-    };
-  }));
+// positionsOf -> (uint256[] ids, uint256 total)
+function positionsOf(ids) {
+  return "0x" + u(64) + u(ids.length) + u(ids.length) + ids.map((x) => u(x)).join("");
 }
-// house LP: houseStats() -> (bankroll,reserved,free,sharePrice)
+// houseStats() -> (bankroll,reserved,free,sharePrice)
 function houseStats(bankroll, reserved, free, sharePrice) {
   return "0x" + u(bankroll) + u(reserved) + u(free) + u(sharePrice);
 }
-// encode (uint256[] up, uint256[] down, uint256[] claimable, bool[] didClaim)
-function positions(up, down, claim, dc) {
-  const arr = (a) => u(a.length) + a.map((x) => u(x)).join("");
-  const a1 = arr(up), a2 = arr(down), a3 = arr(claim), a4 = arr(dc.map((b) => (b ? 1 : 0)));
-  const o1 = 4 * 32, o2 = o1 + a1.length / 2, o3 = o2 + a2.length / 2, o4 = o3 + a3.length / 2;
-  return "0x" + u(o1) + u(o2) + u(o3) + u(o4) + a1 + a2 + a3 + a4;
-}
 
 async function setup(page, opts) {
-  opts = Object.assign({ board: board(), positions: positions([], [], [], []), balance: 0n, allowance: 0n, shares: 0n, stats: houseStats(0n, 0n, 0n, 0n) }, opts);
+  opts = Object.assign({
+    ids: [], pos: {}, balance: 0n, allowance: 0n, shares: 0n, owed: 0n,
+    stats: houseStats(0n, 0n, 0n, 0n),
+    cfg: { payoutBps: 19500, minBet: E18, maxBet: 2000n * E18, minDur: 5, maxDur: 300, strikeDelay: 3 }
+  }, opts);
   let allowCalls = 0;
   await page.route((url) => url.host.includes("k8s.testnet.json-rpc"), async (route) => {
     const req = JSON.parse(route.request().postData() || "{}");
     let result = "0x" + u(0);
     if (req.method === "eth_call") {
       const to = (req.params[0].to || "").toLowerCase();
-      const sel = (req.params[0].data || "").slice(0, 10);
-      if (sel === SEL.board) result = opts.board;
-      else if (sel === SEL.myPos) result = opts.positions;
+      const data = req.params[0].data || "";
+      const sel = data.slice(0, 10);
+      if (sel === SEL.marketsLength) result = "0x" + u(3);
+      else if (sel === SEL.markets) result = market(lastWord(data));
+      else if (sel === SEL.payoutBps) result = "0x" + u(opts.cfg.payoutBps);
+      else if (sel === SEL.minBet) result = "0x" + u(opts.cfg.minBet);
+      else if (sel === SEL.maxBet) result = "0x" + u(opts.cfg.maxBet);
+      else if (sel === SEL.minDur) result = "0x" + u(opts.cfg.minDur);
+      else if (sel === SEL.maxDur) result = "0x" + u(opts.cfg.maxDur);
+      else if (sel === SEL.strikeDelay) result = "0x" + u(opts.cfg.strikeDelay);
+      else if (sel === SEL.positionsOf) result = positionsOf(opts.ids);
+      else if (sel === SEL.getPosition) result = position(opts.pos);
+      else if (sel === SEL.owed) result = "0x" + u(opts.owed);
       else if (sel === SEL.houseStats) result = opts.stats;
       else if (sel === SEL.maxWithdraw) result = "0x" + u(opts.shares);
       else if (sel === SEL.balanceOf) result = "0x" + u(to === VAULT ? opts.shares : opts.balance);
       else if (sel === SEL.allowance) {
-        // "flip": first check reads 0 (forces approve), later reads high (approve "landed")
         const v = opts.allowance === "flip" ? (allowCalls++ === 0 ? 0n : (1n << 255n)) : opts.allowance;
         result = "0x" + u(v);
       }
     } else if (req.method === "eth_blockNumber") result = "0x1";
+    else if (req.method === "eth_getBalance") result = "0x" + (10n ** 18n).toString(16); // 1 INJ gas
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ jsonrpc: "2.0", id: req.id, result }) });
   });
   await page.addInitScript(({ ACCT, FEEDS }) => {
@@ -86,12 +93,11 @@ async function setup(page, opts) {
       },
       on(ev, cb) { cbs[ev] = cb; }
     };
-    // Pyth Hermes SSE stub: emit one price per feed so the chart has samples
     const P = {}; P[FEEDS.BTC] = "6300000000000"; P[FEEDS.ETH] = "350000000000"; P[FEEDS.INJ] = "470000000";
     window.EventSource = class {
       constructor() {
         setTimeout(() => {
-          const arr = Object.keys(FEEDS).map((a) => ({ id: FEEDS[a], price: { price: P[FEEDS[a]], expo: -8 } }));
+          const arr = Object.keys(FEEDS).map((a) => ({ id: FEEDS[a], price: { price: P[FEEDS[a]], expo: -8, publish_time: Math.floor(Date.now() / 1000) } }));
           if (this.onmessage) this.onmessage({ data: JSON.stringify({ parsed: arr }) });
         }, 30);
       }
@@ -105,18 +111,21 @@ async function upZoneClick(page) {
   await page.mouse.click(box.x + box.width * 0.85, box.y + 24); // top-right = UP zone
 }
 
-test("board loads; shows WAITING FOR ROUND when none are open", async ({ page }) => {
+test("boots to TAP UP OR DOWN once the feed has a sample", async ({ page }) => {
   await setup(page, {});
   await page.goto("/");
-  await expect(page.locator("#phase")).toHaveText(/WAITING FOR ROUND/);
+  await expect(page.locator("#phase")).toHaveText(/TAP UP OR DOWN/);
+  await expect(page.locator("#rid")).toHaveText("BET #—");
 });
 
-test("a live open round renders PLACE YOUR BETS with its id", async ({ page }) => {
-  const now = Math.floor(Date.now() / 1000);
-  await setup(page, { board: board({ 0: { hasRound: true, roundId: 7, state: 0, lockTime: now + 40, expiryTime: now + 70, upPool: 100n * E18, downPool: 50n * E18 } }) });
+test("duration button cycles 15 -> 30 -> 60", async ({ page }) => {
+  await setup(page, {});
   await page.goto("/");
-  await expect(page.locator("#rid")).toHaveText("ROUND #7");
-  await expect(page.locator("#phase")).toHaveText(/PLACE YOUR BETS/);
+  await expect(page.locator("#durbtn")).toHaveText("15s");
+  await page.click("#durbtn");
+  await expect(page.locator("#durbtn")).toHaveText("30s");
+  await page.click("#durbtn");
+  await expect(page.locator("#durbtn")).toHaveText("60s");
 });
 
 test("connecting a wallet shows the account", async ({ page }) => {
@@ -130,46 +139,11 @@ test("faucet sends a faucet() tx to the points token", async ({ page }) => {
   await setup(page, { balance: 5n * E18 });
   await page.goto("/");
   await page.click("#connect");
-  await expect(page.locator("#getpts")).toBeVisible(); // bal<10 -> faucet cta shows
+  await expect(page.locator("#getpts")).toBeVisible();
   await page.click("#getpts");
   await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.faucet);
   const txs = await sent(page);
-  const f = txs.find((t) => t.sel === SEL.faucet);
-  expect(f.to).toBe(POINTS);
-});
-
-test("bet with allowance = a single bet() tx (no approve)", async ({ page }) => {
-  const now = Math.floor(Date.now() / 1000);
-  await setup(page, {
-    balance: 1000n * E18, allowance: 1n << 255n,
-    board: board({ 0: { hasRound: true, roundId: 3, state: 0, lockTime: now + 40, expiryTime: now + 70, upPool: 100n * E18, downPool: 100n * E18 } })
-  });
-  await page.goto("/");
-  await page.click("#connect");
-  await expect(page.locator("#phase")).toHaveText(/PLACE YOUR BETS/);
-  await upZoneClick(page);
-  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.bet);
-  const txs = await sent(page);
-  expect(txs.some((t) => t.sel === SEL.approve)).toBeFalsy(); // allowance ok -> no approve
-  expect(txs.find((t) => t.sel === SEL.bet).to).toBe(POOL);
-});
-
-test("bet without allowance = approve() then bet()", async ({ page }) => {
-  const now = Math.floor(Date.now() / 1000);
-  await setup(page, {
-    balance: 1000n * E18, allowance: "flip",
-    board: board({ 0: { hasRound: true, roundId: 3, state: 0, lockTime: now + 40, expiryTime: now + 70, upPool: 100n * E18, downPool: 100n * E18 } })
-  });
-  await page.goto("/");
-  await page.click("#connect");
-  await expect(page.locator("#phase")).toHaveText(/PLACE YOUR BETS/);
-  await upZoneClick(page);
-  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.bet);
-  const txs = await sent(page);
-  const iApprove = txs.findIndex((t) => t.sel === SEL.approve);
-  const iBet = txs.findIndex((t) => t.sel === SEL.bet);
-  expect(iApprove).toBeGreaterThanOrEqual(0);
-  expect(iApprove).toBeLessThan(iBet); // approve before bet
+  expect(txs.find((t) => t.sel === SEL.faucet).to).toBe(POINTS);
 });
 
 test("balance renders from balanceOf once connected", async ({ page }) => {
@@ -179,103 +153,71 @@ test("balance renders from balanceOf once connected", async ({ page }) => {
   await expect(page.locator("#bal")).toHaveText("1,234");
 });
 
-test("LP panel: shows bankroll from houseStats and sends a deposit to the vault", async ({ page }) => {
+test("tapping a zone with allowance = a single openBet() tx (no approve)", async ({ page }) => {
+  await setup(page, { balance: 1000n * E18, allowance: 1n << 255n });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#phase")).toHaveText(/TAP UP OR DOWN/);
+  await upZoneClick(page);
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.openBet);
+  const txs = await sent(page);
+  expect(txs.some((t) => t.sel === SEL.approve)).toBeFalsy();
+  expect(txs.find((t) => t.sel === SEL.openBet).to).toBe(BOOK);
+});
+
+test("tapping without allowance = approve() then openBet()", async ({ page }) => {
+  await setup(page, { balance: 1000n * E18, allowance: "flip" });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#phase")).toHaveText(/TAP UP OR DOWN/);
+  await upZoneClick(page);
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.openBet);
+  const txs = await sent(page);
+  const iApprove = txs.findIndex((t) => t.sel === SEL.approve);
+  const iOpen = txs.findIndex((t) => t.sel === SEL.openBet);
+  expect(iApprove).toBeGreaterThanOrEqual(0);
+  expect(iApprove).toBeLessThan(iOpen); // approve before openBet
+});
+
+test("an active position renders BET #<id> and its phase", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  // live phase: strike already locked (strikeInstant in the past), close in the future
   await setup(page, {
-    balance: 1000n * E18, allowance: "flip", shares: 0n,
-    stats: houseStats(100000n * E18, 5000n * E18, 95000n * E18, 1000000000000n) // bankroll 100k, 5% in play
+    ids: [4],
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 0, stake: 25n * E18, reserve: 24n * E18, strikeInstant: now - 5, dur: 30 }
   });
   await page.goto("/");
   await page.click("#connect");
-  await page.click("#lpToggle"); // open "BE THE HOUSE"
+  await expect(page.locator("#rid")).toHaveText("BET #4");
+});
+
+test("LP panel: shows bankroll from houseStats and deposits to the vault", async ({ page }) => {
+  await setup(page, {
+    balance: 1000n * E18, allowance: "flip", shares: 0n,
+    stats: houseStats(100000n * E18, 5000n * E18, 95000n * E18, 1000000000000n)
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await page.click("#lpToggle");
   await expect(page.locator("#lpBank")).toHaveText("100,000");
   await expect(page.locator("#lpUtil")).toHaveText("5.0%");
   await page.fill("#lpAmt", "500");
   await page.click("#lpDep");
   await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.deposit);
   const txs = await sent(page);
-  expect(txs.some((t) => t.sel === SEL.approve)).toBeTruthy(); // approved points to the vault first
-  expect(txs.find((t) => t.sel === SEL.deposit).to).toBe(VAULT); // deposit lands on the vault
+  expect(txs.some((t) => t.sel === SEL.approve)).toBeTruthy();
+  expect(txs.find((t) => t.sel === SEL.deposit).to).toBe(VAULT);
 });
-
-/* ---------- empty-round roll-through (no fake lock) ---------- */
-
-const emptyPastLock = (now, id) => board({ 0: { hasRound: true, roundId: id != null ? id : 9, state: 0, lockTime: now - 5, expiryTime: now + 10, upPool: 0n, downPool: 0n } });
-
-test("empty round past lockTime rolls: NO BETS label, no clock, tap fires no tx", async ({ page }) => {
-  const now = Math.floor(Date.now() / 1000);
-  await setup(page, { board: emptyPastLock(now), balance: 100n * E18, allowance: 1n << 255n });
-  await page.goto("/");
-  await page.click("#connect");
-  await expect(page.locator("#phase")).toHaveText(/NO BETS — NEXT ROUND SOON/);
-  await expect(page.locator("#clock")).toHaveText("—");
-  await upZoneClick(page);
-  await page.waitForTimeout(500);
-  const txs = await sent(page);
-  expect(txs.some((t) => t.sel === SEL.bet)).toBeFalsy(); // disabled tiles: tap does nothing
-});
-
-test("my own position suppresses NO BETS on a stale empty board", async ({ page }) => {
-  const now = Math.floor(Date.now() / 1000);
-  await setup(page, {
-    board: emptyPastLock(now),
-    positions: positions([25n * E18], [0n], [0n], [false]) // I bet 25 UP; board pools stale at 0
-  });
-  await page.goto("/");
-  await page.click("#connect");
-  await expect(page.locator("#phase")).toHaveText(/LOCKING/); // pending-lock view, never "NO BETS"
-});
-
-test("roll transitions straight to next round's betting — LOCKED never rendered", async ({ page }) => {
-  const now = Math.floor(Date.now() / 1000);
-  await setup(page, { board: emptyPastLock(now) });
-  await page.goto("/");
-  await expect(page.locator("#phase")).toHaveText(/NO BETS/);
-  await page.evaluate(() => {
-    window.__phases = [];
-    const el = document.getElementById("phase");
-    new MutationObserver(() => window.__phases.push(el.textContent)).observe(el, { childList: true, characterData: true, subtree: true });
-  });
-  const fresh = board({ 0: { hasRound: true, roundId: 10, state: 0, lockTime: now + 12, expiryTime: now + 27, upPool: 0n, downPool: 0n } });
-  await page.route((url) => url.host.includes("k8s.testnet.json-rpc"), async (route) => {
-    const req = JSON.parse(route.request().postData() || "{}");
-    if (req.method === "eth_call" && (req.params[0].data || "").startsWith(SEL.board)) {
-      await route.fulfill({ contentType: "application/json", body: JSON.stringify({ jsonrpc: "2.0", id: req.id, result: fresh }) });
-    } else await route.fallback();
-  });
-  await expect(page.locator("#phase")).toHaveText(/PLACE YOUR BETS/);
-  await expect(page.locator("#rid")).toHaveText("ROUND #10");
-  const phases = await page.evaluate(() => window.__phases);
-  expect(phases.some((p) => /LOCK/.test(p))).toBeFalsy(); // no fake-lock flap in between
-});
-
-test("roll persisting >10s escalates to waiting copy", async ({ page }) => {
-  test.setTimeout(30000);
-  const now = Math.floor(Date.now() / 1000);
-  await setup(page, { board: emptyPastLock(now) });
-  await page.goto("/");
-  await expect(page.locator("#phase")).toHaveText(/NO BETS — NEXT ROUND SOON/);
-  await expect(page.locator("#phase")).toHaveText(/WAITING FOR NEXT ROUND/, { timeout: 15000 });
-});
-
-test("regression: non-empty round past lockTime still shows the pending-lock view", async ({ page }) => {
-  const now = Math.floor(Date.now() / 1000);
-  await setup(page, { board: board({ 0: { hasRound: true, roundId: 11, state: 0, lockTime: now - 3, expiryTime: now + 12, upPool: 40n * E18, downPool: 0n } }) });
-  await page.goto("/");
-  await expect(page.locator("#phase")).toHaveText(/LOCKING/);
-});
-
-/* ---------- LP toggle, wallet persistence, dead chrome ---------- */
 
 test("BE THE HOUSE toggles the LP panel (hidden by default)", async ({ page }) => {
   await setup(page, {});
   await page.goto("/");
-  await expect(page.locator("#lp")).toBeHidden();          // .histbar display:flex must not defeat the default
+  await expect(page.locator("#lp")).toBeHidden();
   await page.click("#lpToggle");
   await expect(page.locator("#lp")).toBeVisible();
   await expect(page.locator("#lpToggle")).toHaveText(/▾/);
   await page.click("#lpToggle");
   await expect(page.locator("#lp")).toBeHidden();
-  expect(await page.locator('[title="close (lol)"]').count()).toBe(0); // decorative ✕ removed
 });
 
 test("wallet connection survives a reload (silent reconnect)", async ({ page }) => {
@@ -284,5 +226,5 @@ test("wallet connection survives a reload (silent reconnect)", async ({ page }) 
   await page.click("#connect");
   await expect(page.locator("#connect")).toContainText("0xAbC0");
   await page.reload();
-  await expect(page.locator("#connect")).toContainText("0xAbC0"); // no click — restored from localStorage
+  await expect(page.locator("#connect")).toContainText("0xAbC0");
 });

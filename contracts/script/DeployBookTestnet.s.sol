@@ -53,7 +53,13 @@ contract DeployBookTestnet is Script {
         vm.startBroadcast();
         HouseVault vault = new HouseVault(IERC20(POINTS), "HELIX House LP (testnet)", "hHLX-t");
         PredictionBook book = new PredictionBook(
-            IPyth(PYTH_TESTNET), vault, PAYOUT_BPS, MAX_BET_EXPOSURE_BPS, MAX_AGG_EXPOSURE_BPS, MIN_BET, MAX_BET
+            IPyth(PYTH_TESTNET),
+            vault,
+            PAYOUT_BPS,
+            MAX_BET_EXPOSURE_BPS,
+            MAX_AGG_EXPOSURE_BPS,
+            MIN_BET,
+            MAX_BET
         );
         vault.setHouse(address(book));
 

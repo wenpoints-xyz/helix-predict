@@ -125,7 +125,11 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     event MarketAdded(uint256 indexed marketId, bytes32 indexed feedId);
     event MarketEnabled(uint256 indexed marketId, bool enabled);
     event ParamsSet(
-        uint256 payoutBps, uint256 maxBetExposureBps, uint256 maxAggExposureBps, uint256 minBet, uint256 maxBet
+        uint256 payoutBps,
+        uint256 maxBetExposureBps,
+        uint256 maxAggExposureBps,
+        uint256 minBet,
+        uint256 maxBet
     );
     event GuardsSet(
         uint256 maxConfBps,
@@ -233,7 +237,9 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         uint256 _minBet,
         uint256 _maxBet
     ) external onlyOwner {
-        if (_payoutBps <= BPS || _payoutBps > MAX_PAYOUT_BPS) revert PayoutOutOfRange();
+        if (_payoutBps <= BPS || _payoutBps > MAX_PAYOUT_BPS) {
+            revert PayoutOutOfRange();
+        }
         if (_maxBetExposureBps > MAX_EXPOSURE_BPS || _maxAggExposureBps > MAX_EXPOSURE_BPS) {
             revert ExposureCapTooHigh();
         }
@@ -271,7 +277,15 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         settleTol = _settleTol;
         settleGrace = _settleGrace;
         emit GuardsSet(
-            _maxConfBps, _tipBps, _maxTip, _maxOpenPerUser, _minDur, _maxDur, _strikeDelay, _settleTol, _settleGrace
+            _maxConfBps,
+            _tipBps,
+            _maxTip,
+            _maxOpenPerUser,
+            _minDur,
+            _maxDur,
+            _strikeDelay,
+            _settleTol,
+            _settleGrace
         );
     }
 
@@ -354,11 +368,11 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     /// @notice Batch settle. Skips (does not revert) any bet that isn't matured/open or whose oracle
     /// read fails, so one bad bet can't block the sweep. msg.value must cover the sum of update fees;
     /// unspent value is refunded.
-    function settleMany(uint256[] calldata betIds, bytes[][] calldata strikeData, bytes[][] calldata closeData)
-        external
-        payable
-        nonReentrant
-    {
+    function settleMany(
+        uint256[] calldata betIds,
+        bytes[][] calldata strikeData,
+        bytes[][] calldata closeData
+    ) external payable nonReentrant {
         uint256 n = betIds.length;
         if (strikeData.length != n || closeData.length != n) revert BadParams();
         uint256 spent;
@@ -571,7 +585,11 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         if (t > maxTip) t = maxTip;
     }
 
-    function _totalFee(bytes[] calldata strikeData, bytes[] calldata closeData) internal view returns (uint256) {
+    function _totalFee(bytes[] calldata strikeData, bytes[] calldata closeData)
+        internal
+        view
+        returns (uint256)
+    {
         return pyth.getUpdateFee(strikeData) + pyth.getUpdateFee(closeData);
     }
 

@@ -49,7 +49,13 @@ contract Handler is Test {
 
     receive() external payable {}
 
-    constructor(PredictionBook _book, HouseVault _vault, MockERC20I _token, MockPythUnique _pyth, uint256 _mid) {
+    constructor(
+        PredictionBook _book,
+        HouseVault _vault,
+        MockERC20I _token,
+        MockPythUnique _pyth,
+        uint256 _mid
+    ) {
         book = _book;
         vault = _vault;
         token = _token;
