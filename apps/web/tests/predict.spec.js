@@ -221,6 +221,18 @@ test("pending strip: a matured open bet shows 'settling…'", async ({ page }) =
   await expect(page.locator("#pendingMsg")).toHaveText(/settling/);
 });
 
+test("a matured-but-unsettled bet reads SETTLING… (chart freezes at the wall)", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, {
+    ids: [3],
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 0, stake: 25n * E18, reserve: 24n * E18, strikeInstant: now - 40, dur: 15 } // closed 25s ago, keeper not yet settled
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#rid")).toHaveText("BET #3");
+  await expect(page.locator("#phase")).toHaveText(/SETTLING…/);
+});
+
 test("pending strip: unclaimed winnings show CLAIM and fire claim()", async ({ page }) => {
   const now = Math.floor(Date.now() / 1000);
   await setup(page, {

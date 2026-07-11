@@ -552,15 +552,28 @@
     // The split line sits at the entry strike once it's known, else at the live price (preview).
     var splitPrice = (v && v.strike != null) ? v.strike : f.disp;
 
-    // time window: future = the bet's duration; during a running bet pin the right edge to close
+    // The close instant is a WALL: at/after it the outcome is decided by the price at that instant,
+    // and later movement is irrelevant. So during settling we FREEZE the window at the close instant
+    // (with a little room to its right) instead of scrolling with `now` — the head stops at the line,
+    // it never crosses-then-reverses, and the dashes don't drift.
+    var settling = v && v.phase === "settling";
     var futMs = (v && v.tfMs) || S.dur * 1000, histMs = 3 * futMs;
-    var rightT = (v && (v.phase === "live" || v.phase === "settling")) ? Math.max(v.closeInstantMs, now) : now + futMs;
+    var rightMargin = futMs * 0.4; // gap kept to the right of the finish line
+    var rightT = (v && (v.phase === "live" || v.phase === "settling")) ? v.closeInstantMs + rightMargin : now + futMs;
     var t1 = rightT, t0 = t1 - (histMs + futMs);
     var xOf = function (t) { return (t - t0) / (t1 - t0) * W; };
+    // the deterministic close = first Pyth tick at/after closeInstant (the price that actually settles)
+    var closeTick = null;
+    if (v && (v.phase === "live" || v.phase === "settling") && now >= v.closeInstantMs) {
+      var _cs = v.closeInstantMs / 1000;
+      for (var ci = 0; ci < f.samples.length; ci++) { if (f.samples[ci].pt && f.samples[ci].pt >= _cs) { closeTick = f.samples[ci]; break; } }
+    }
+    var closePrice = settling ? (closeTick ? closeTick.p : f.disp) : null; // hold last price during the ~1s reveal gap
 
     var lo = Infinity, hi = -Infinity;
     for (var i = 0; i < f.samples.length; i++) { var sm = f.samples[i]; if (sm.t < t0) continue; if (sm.p < lo) lo = sm.p; if (sm.p > hi) hi = sm.p; }
     if (splitPrice < lo) lo = splitPrice; if (splitPrice > hi) hi = splitPrice;
+    if (closePrice != null) { if (closePrice < lo) lo = closePrice; if (closePrice > hi) hi = closePrice; }
     var pad = Math.max((hi - lo) * 0.35, splitPrice * 0.0004);
     var tMin = lo - pad, tMax = hi + pad;
     if (!yScale.init) { yScale.min = tMin; yScale.max = tMax; yScale.init = true; }
@@ -610,24 +623,27 @@
     ctx.fillStyle = PAL.accent; ctx.fillRect(splitX - tw - 4, strikeY - 9, tw, 18);
     ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.fillText(tag, splitX - tw / 2 - 4, strikeY + 4);
 
-    // price line + head dot
+    // price line + head dot. During settling the line STOPS at the finish line (the wall): post-close
+    // ticks aren't drawn and the head doesn't run to `now` — the bet is already decided at the wall.
     ctx.strokeStyle = PAL["accent-2"]; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
     ctx.beginPath();
     var started = false;
     for (i = 0; i < f.samples.length; i++) {
       sm = f.samples[i]; if (sm.t < t0 - 1000) continue;
+      if (settling && sm.t > v.closeInstantMs) continue; // ignore movement past the wall
       var px = xOf(sm.t), py = yOf(sm.p);
       if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
     }
-    var headX = xOf(now), headY = yOf(f.disp);
+    var headX = settling ? xOf(v.closeInstantMs) : xOf(now);
+    var headY = settling ? yOf(closePrice) : yOf(f.disp);
     if (started) ctx.lineTo(headX, headY);
     ctx.stroke();
     ctx.fillStyle = PAL["accent-2"];
     ctx.globalAlpha = 0.25; ctx.beginPath(); ctx.arc(headX, headY, 7, 0, 7); ctx.fill();
     ctx.globalAlpha = 1; ctx.beginPath(); ctx.arc(headX, headY, 3, 0, 7); ctx.fill();
 
-    // live price readout riding the dot during a running bet: ▲ green above strike / ▼ red below
-    if (v && (v.phase === "live" || v.phase === "settling") && v.strike != null) {
+    // live price readout riding the dot while the bet is running (pre-close): ▲ green above strike / ▼ red below
+    if (v && v.phase === "live" && v.strike != null) {
       var live = f.disp, strike = v.strike;
       var col = live > strike ? PAL.ok : live < strike ? PAL.bad : PAL["ink-dim"];
       var arrow = live > strike ? "▲" : live < strike ? "▼" : "•";
@@ -661,33 +677,30 @@
       if (v && v.up === (z.side === "up")) { ctx.fillStyle = z.col; ctx.fillText("YOUR BET", zx, mid + 18 + (ready ? 14 : 0)); }
     });
     ctx.font = "bold 10px 'Courier New',monospace"; ctx.textAlign = "center";
-    ctx.fillStyle = ready ? PAL.ok : PAL.bad;
-    ctx.fillText(ready ? ">> TAP TO BET · " + S.dur + "s <<" : (v.phase === "arming" ? "STRIKE LOCKING IN" : "SWEAT IT"), zx, 12);
+    ctx.fillStyle = ready ? PAL.ok : settling ? PAL.accent : PAL.bad;
+    ctx.fillText(ready ? ">> TAP TO BET · " + S.dur + "s <<" : (v.phase === "arming" ? "STRIKE LOCKING IN" : settling ? "SETTLING…" : "SWEAT IT"), zx, 12);
 
-    // finish line during a running bet. The settle price is the first tick at/after closeInstant, but
-    // Hermes lag means that tick lands on the chart ~1s to the RIGHT of the raw close instant. So the
-    // line glides to sit exactly on that settle tick once it exists — the dashed line and the ringed
-    // close tick coincide instead of drifting apart.
+    // finish line = the close instant, a STATIC wall (the deadline doesn't move). Once the
+    // deterministic close tick lands, stamp the verdict (WON/LOST/PUSH + the exact settle price)
+    // right ON the line — the outcome is decided AT the wall, never by movement past it.
     if (v && (v.phase === "live" || v.phase === "settling")) {
-      var closeTick = null;
-      if (now >= v.closeInstantMs) {
-        var closeSec = v.closeInstantMs / 1000;
-        for (var si = 0; si < f.samples.length; si++) {
-          if (f.samples[si].pt && f.samples[si].pt >= closeSec) { closeTick = f.samples[si]; break; }
-        }
-      }
-      var targetT = closeTick ? closeTick.t : v.closeInstantMs; // align to the settle tick's arrival
-      if (S.finishT[v.betId] == null) S.finishT[v.betId] = v.closeInstantMs;
-      S.finishT[v.betId] += (targetT - S.finishT[v.betId]) * 0.2; // glide, don't snap
-      var fx = Math.min(xOf(S.finishT[v.betId]), W - 1);
-      ctx.strokeStyle = PAL.ink; ctx.globalAlpha = 0.5; ctx.setLineDash([2, 3]);
+      var fx = Math.min(Math.max(xOf(v.closeInstantMs), 1), W - 1);
+      ctx.strokeStyle = settling ? PAL.ink : PAL["ink-dim"]; ctx.globalAlpha = settling ? 0.75 : 0.5; ctx.setLineDash([2, 3]);
       ctx.beginPath(); ctx.moveTo(fx, 0); ctx.lineTo(fx, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
-      if (closeTick) {
-        var mx = xOf(closeTick.t), my = yOf(closeTick.p), strk = v.strike;
-        ctx.strokeStyle = strk != null && closeTick.p > strk ? PAL.ok : strk != null && closeTick.p < strk ? PAL.bad : PAL.ink;
-        ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(mx, my, 6, 0, 7); ctx.stroke();
-        ctx.font = "bold 9px 'Courier New',monospace"; ctx.textAlign = "center";
-        ctx.fillStyle = PAL["ink-dim"]; ctx.fillText("close", mx, my - 10);
+      if (settling) {
+        var vy = Math.max(16, Math.min(H - 8, yOf(closePrice)));
+        if (closeTick) {
+          var strk = v.strike;
+          var tie = strk != null && closeTick.p === strk;
+          var won = strk != null && (v.up ? closeTick.p > strk : closeTick.p < strk);
+          var vcol = tie ? PAL["ink-dim"] : won ? PAL.ok : PAL.bad;
+          ctx.strokeStyle = vcol; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(fx, vy, 6, 0, 7); ctx.stroke();
+          ctx.fillStyle = vcol; ctx.font = "bold 11px 'Courier New',monospace"; ctx.textAlign = "center";
+          ctx.fillText((tie ? "PUSH" : won ? "WON" : "LOST") + " " + fmt(closeTick.p), fx, vy - 11);
+        } else {
+          ctx.fillStyle = PAL["ink-dim"]; ctx.font = "bold 9px 'Courier New',monospace"; ctx.textAlign = "center";
+          ctx.fillText("settling…", fx, Math.max(16, Math.min(H - 8, yOf(closePrice))) - 11);
+        }
       }
     }
   }
