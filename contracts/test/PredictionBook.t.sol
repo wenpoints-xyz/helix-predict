@@ -507,8 +507,10 @@ contract PredictionBookTest is Test {
         book.setParams(19900, 5000, 5000, MINBET, MAXBET); // payout 1.99x, edge 100bps
         book.setGuards(0, 100, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
         address eve = address(0xE7E);
-        token.mint(eve, 1_000_000 ether); vm.deal(eve, 10 ether);
-        vm.prank(eve); token.approve(address(book), type(uint256).max);
+        token.mint(eve, 1_000_000 ether);
+        vm.deal(eve, 10 ether);
+        vm.prank(eve);
+        token.approve(address(book), type(uint256).max);
         uint256 S = 1000 ether;
         uint256 before = token.balanceOf(eve);
         vm.startPrank(eve);
@@ -519,7 +521,9 @@ contract PredictionBookTest is Test {
         book.setParams(15000, 5000, 5000, MINBET, MAXBET); // edge now 5000bps
         book.setGuards(0, 2000, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE); // tip 20%
         PredictionBook.Position memory pp = book.getPosition(up);
-        uint64 sAt = pp.strikeInstant; uint64 cAt = sAt + 30; vm.warp(cAt);
+        uint64 sAt = pp.strikeInstant;
+        uint64 cAt = sAt + 30;
+        vm.warp(cAt);
         bytes[] memory sData = _uupd(100e8, 0, sAt, sAt - 1);
         bytes[] memory cData = _uupd(101e8, 0, cAt, cAt - 1);
         vm.startPrank(eve);
@@ -550,5 +554,4 @@ contract PredictionBookTest is Test {
         book.voidExpired(betId);
         assertEq(uint8(book.getPosition(betId).result), uint8(PredictionBook.Result.Void));
     }
-
 }
