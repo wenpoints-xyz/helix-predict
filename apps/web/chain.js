@@ -136,14 +136,22 @@
   // ---- reads ----
   function positionsLength() { return ethCall(NET.book, SEL.positionsLength).then(function (h) { return Number(BigInt(h)); }); }
   function getPosition(id) { return ethCall(NET.book, SEL.getPosition + u256(id)).then(function (h) { return decodePosition(id, h); }); }
-  // A user's positions (paged betIds) then the full struct for each — newest first.
+  // A user's most-recent `count` positions (paged betIds) then the full struct for each — newest first.
+  // Grabs the NEWEST window: positionsOf appends, so for >count bets we page to the tail, not the head.
   function myPositions(addr, count) {
     count = count || 40;
+    function finish(ids, total) {
+      var order = ids.slice().reverse(); // newest first
+      return Promise.all(order.map(getPosition)).then(function (ps) {
+        return { total: total, positions: ps.filter(Boolean) };
+      });
+    }
     return ethCall(NET.book, SEL.positionsOf + addr32(addr) + u256(0) + u256(count)).then(function (h) {
       var r = decodePositionsOf(h);
-      var ids = r.ids.slice().reverse();               // newest first
-      return Promise.all(ids.map(getPosition)).then(function (ps) {
-        return { total: r.total, positions: ps.filter(Boolean) };
+      if (r.total <= count) return finish(r.ids, r.total);
+      var start = r.total - count; // fetch the newest window instead of the oldest
+      return ethCall(NET.book, SEL.positionsOf + addr32(addr) + u256(start) + u256(count)).then(function (h2) {
+        return finish(decodePositionsOf(h2).ids, r.total);
       });
     });
   }
