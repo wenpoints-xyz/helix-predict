@@ -1,28 +1,29 @@
-/* chain.js — zero-dep binding layer for the $HELIXPOINT predict arcade.
-   Reads the whole board in ONE eth_call (boardSnapshot) and a user's bets in one
-   (myPositions); writes bet/claim/faucet/approve through an injected wallet. Network is
-   picked by hostname: predict.test.* (or ?net=test / localhost / *.pages.dev) => testnet
-   (live); predict.* => mainnet (gated "coming soon" until $HELIXPOINT's EVM pair lands). */
+/* chain.js — zero-dep binding layer for the $HELIXPOINT predict arcade (PredictionBook model).
+   No shared rounds: each user opens their OWN position (openBet), which the keeper settles at a
+   fixed past instant. Reads the user's positions (positionsOf + getPosition), the markets list, and
+   the LP house stats; writes openBet/claim/faucet/approve through an injected wallet. Network is
+   picked by hostname: predict.test.* (or ?net=test / localhost / *.pages.dev) => testnet (live);
+   predict.* => mainnet (gated "coming soon" until $HELIXPOINT's EVM pair lands). */
 (function () {
   "use strict";
 
   // ---- network config ----
-  // "pool" is the PredictionHouse (fixed-odds vs an LP vault); "vault" is the HouseVault (ERC4626).
+  // "book" is the PredictionBook (per-user fixed-odds vs an LP vault); "vault" is HouseVault (ERC4626).
   var NETS = {
     test: {
       key: "test", name: "Injective Testnet", chainIdHex: "0x59f", // 1439
       rpc: "https://k8s.testnet.json-rpc.injective.network/",
       explorer: "https://testnet.blockscout.injective.network",
-      pool: "0xe7773Db880BF38574441699A60E53d68a52Db680",   // PredictionHouse
-      vault: "0x15FC2a0020A2a8309E602fC7B148B120C9C3b587",  // HouseVault (LP)
-      points: "0x52045F671C452b7f91a7e436c64f126E78638F14", // MockPoints (faucet)
+      book: "0x6ea22353f4e6Be0A4D193CE7Bb3f63186BDf74e3",  // PredictionBook (per-user positions)
+      vault: "0x745D463b01667Bf15915A27c23746d6D2Ad59f2B", // HouseVault (LP) — fresh, wired to the Book
+      points: "0x52045F671C452b7f91a7e436c64f126E78638F14", // MockPoints (faucet) — reused
       live: true
     },
     prod: {
       key: "prod", name: "Injective Mainnet", chainIdHex: "0x6f0", // 1776
       rpc: "https://sentry.evm-rpc.injective.network/",
       explorer: "https://blockscout.injective.network",
-      pool: "", vault: "", points: "", live: false // not deployed yet — frontend gates as "coming soon"
+      book: "", vault: "", points: "", live: false // not deployed yet — frontend gates as "coming soon"
     }
   };
   function pickNet() {
@@ -37,14 +38,25 @@
   var NET = pickNet();
   var UNIT = 1000000000000000000n;   // MockPoints is 18-decimal; 1 chip = 1e18 wei
 
-  // ---- selectors ----
+  // ---- selectors (PredictionBook) ----
   var SEL = {
-    board: "0x938be1ab",   // boardSnapshot()
-    myPos: "0x98a973bb",   // myPositions(address,uint256[])
-    bet: "0x8decaec0",     // bet(uint256,bool,uint256)
-    claim: "0x379607f5",   // claim(uint256)
-    faucet: "0x57915897",  // faucet(uint256)
-    approve: "0x095ea7b3", // approve(address,uint256)
+    openBet: "0x058a345d",       // openBet(uint256 marketId,bool up,uint256 stake,uint64 dur)
+    claim: "0x379607f5",         // claim(uint256 betId)
+    positionsOf: "0xdc9d54ef",   // positionsOf(address,uint256 start,uint256 count) -> (uint256[] ids,uint256 total)
+    getPosition: "0xeb02c301",   // getPosition(uint256) -> Position
+    positionsLength: "0xd6887bfa",
+    marketsLength: "0xa5402544",
+    markets: "0xb1283e77",       // markets(uint256) -> (bytes32 feedId,bool enabled)
+    reserveFor: "0x6542ed86",    // reserveFor(uint256 stake)
+    owed: "0xb1276604",          // owed(uint256 betId)
+    payoutBps: "0x020f09b7",
+    minBet: "0x9619367d",
+    maxBet: "0x2e5b2168",
+    minDur: "0x67b38200",
+    maxDur: "0xeab50bd2",
+    strikeDelay: "0x51fd4c2a",
+    faucet: "0x57915897",        // faucet(uint256)
+    approve: "0x095ea7b3",       // approve(address,uint256)
     balanceOf: "0x70a08231",
     allowance: "0xdd62ed3e",
     // HouseVault (LP)
@@ -53,6 +65,8 @@
     withdraw: "0xb460af94",   // withdraw(uint256 assets,address receiver,address owner)
     maxWithdraw: "0xce96cb77" // maxWithdraw(address)
   };
+  // Position.result enum
+  var RESULT = { OPEN: 0, WIN: 1, LOSS: 2, VOID: 3 };
 
   // ---- hex/abi helpers ----
   function strip0x(h) { return h && h.indexOf("0x") === 0 ? h.slice(2) : (h || ""); }
@@ -77,62 +91,89 @@
   function ethCall(to, data) { return rpc("eth_call", [{ to: to, data: data }, "latest"]); }
 
   // ---- decoders ----
-  // boardSnapshot() -> RoundInfo[] (dynamic array of a 16-field STATIC struct; +payoutBps vs the pool)
-  function decodeBoard(hex) {
+  // getPosition(betId) -> Position (11 STATIC fields, encoded inline)
+  function decodePosition(id, hex) {
     var w = words(hex);
-    var base = Number(big(w[0])) / 32;         // offset -> word index of length
-    var n = Number(big(w[base]));
-    var out = [];
-    for (var k = 0; k < n; k++) {
-      var s = base + 1 + k * 16;
-      out.push({
-        marketId: Number(big(w[s + 0])),
-        feedId: "0x" + w[s + 1],
-        timeframe: Number(big(w[s + 2])),
-        marketEnabled: big(w[s + 3]) !== 0n,
-        hasRound: big(w[s + 4]) !== 0n,
-        roundId: Number(big(w[s + 5])),
-        lockTime: Number(big(w[s + 6])),
-        expiryTime: Number(big(w[s + 7])),
-        strike: sInt(w[s + 8]),   // raw Pyth int64 (BigInt); human = strike * 10^expo
-        close: sInt(w[s + 9]),
-        upPool: big(w[s + 10]),   // BigInt wei (UP stake total)
-        downPool: big(w[s + 11]), // DOWN stake total
-        payoutBps: Number(big(w[s + 12])), // fixed odds, e.g. 19500 = 1.95x
-        state: Number(big(w[s + 13])), // 0 Open, 1 Locked, 2 Settled
-        upWon: big(w[s + 14]) !== 0n,
-        voided: big(w[s + 15]) !== 0n
-      });
-    }
-    return out;
+    if (w.length < 11) return null;
+    return {
+      betId: id,
+      bettor: "0x" + w[0].slice(24),
+      marketId: Number(big(w[1])),
+      payoutBps: Number(big(w[2])),
+      up: big(w[3]) !== 0n,
+      result: Number(big(w[4])),        // 0 Open,1 Win,2 Loss,3 Void
+      stake: big(w[5]),                 // wei
+      reserve: big(w[6]),
+      strikeInstant: Number(big(w[7])), // unix s; first tick >= this = the entry strike
+      dur: Number(big(w[8])),           // N seconds; close instant = strikeInstant + dur
+      strike: sInt(w[9]),               // raw Pyth int64 (0 until settled)
+      close: sInt(w[10])
+    };
+  }
+  // positionsOf(user,start,count) -> (uint256[] ids, uint256 total)
+  function decodePositionsOf(hex) {
+    var w = words(hex);
+    var off = Number(big(w[0])) / 32;   // offset (words) to ids array
+    var total = Number(big(w[1]));
+    var len = Number(big(w[off]));
+    var ids = [];
+    for (var i = 0; i < len; i++) ids.push(Number(big(w[off + 1 + i])));
+    return { ids: ids, total: total };
+  }
+  // markets(i) -> (bytes32 feedId, bool enabled)
+  function decodeMarket(i, hex) {
+    var w = words(hex);
+    return { marketId: i, feedId: "0x" + w[0], enabled: big(w[1]) !== 0n };
   }
   // houseStats() -> (bankroll, reserved, free, sharePrice) all uint256 wei
   function decodeStats(hex) {
     var w = words(hex);
     return { bankroll: big(w[0]), reserved: big(w[1]), free: big(w[2]), sharePrice: big(w[3]) };
   }
-  // myPositions -> (uint256[] up, uint256[] down, uint256[] claimable, bool[] didClaim)
-  function decodeMyPositions(hex, ids) {
-    var w = words(hex);
-    function arrAt(byteOff) { var wi = byteOff / 32; var len = Number(big(w[wi])); var a = []; for (var i = 0; i < len; i++) a.push(big(w[wi + 1 + i])); return a; }
-    var up = arrAt(Number(big(w[0]))), down = arrAt(Number(big(w[1]))), claim = arrAt(Number(big(w[2]))), dc = arrAt(Number(big(w[3])));
-    return ids.map(function (id, i) {
-      return { id: id, up: up[i] || 0n, down: down[i] || 0n, claimable: claim[i] || 0n, claimed: (dc[i] || 0n) !== 0n };
+
+  // ---- reads ----
+  function positionsLength() { return ethCall(NET.book, SEL.positionsLength).then(function (h) { return Number(BigInt(h)); }); }
+  function getPosition(id) { return ethCall(NET.book, SEL.getPosition + u256(id)).then(function (h) { return decodePosition(id, h); }); }
+  // A user's positions (paged betIds) then the full struct for each — newest first.
+  function myPositions(addr, count) {
+    count = count || 40;
+    return ethCall(NET.book, SEL.positionsOf + addr32(addr) + u256(0) + u256(count)).then(function (h) {
+      var r = decodePositionsOf(h);
+      var ids = r.ids.slice().reverse();               // newest first
+      return Promise.all(ids.map(getPosition)).then(function (ps) {
+        return { total: r.total, positions: ps.filter(Boolean) };
+      });
     });
   }
-
-  // ---- reads (one call each) ----
-  function boardSnapshot() { return ethCall(NET.pool, SEL.board).then(decodeBoard); }
-  function myPositions(addr, ids) {
-    if (!ids.length) return Promise.resolve([]);
-    var data = SEL.myPos + addr32(addr) + u256(64) + u256(ids.length) + ids.map(u256).join("");
-    return ethCall(NET.pool, data).then(function (h) { return decodeMyPositions(h, ids); });
+  function marketsLength() { return ethCall(NET.book, SEL.marketsLength).then(function (h) { return Number(BigInt(h)); }); }
+  function markets() { // -> [{marketId,feedId,enabled}]
+    return marketsLength().then(function (n) {
+      var calls = [];
+      for (var i = 0; i < n; i++) (function (i) {
+        calls.push(ethCall(NET.book, SEL.markets + u256(i)).then(function (h) { return decodeMarket(i, h); }));
+      })(i);
+      return Promise.all(calls);
+    });
+  }
+  function owed(id) { return ethCall(NET.book, SEL.owed + u256(id)).then(function (h) { return BigInt(h); }); }
+  function reserveFor(stakeWei) { return ethCall(NET.book, SEL.reserveFor + u256(stakeWei)).then(function (h) { return BigInt(h); }); }
+  function _param(sel) { return ethCall(NET.book, sel).then(function (h) { return BigInt(h); }); }
+  // Batch the config the UI needs (odds, stake bounds, duration bounds) in one go.
+  function bookConfig() {
+    return Promise.all([
+      _param(SEL.payoutBps), _param(SEL.minBet), _param(SEL.maxBet), _param(SEL.minDur), _param(SEL.maxDur), _param(SEL.strikeDelay)
+    ]).then(function (r) {
+      return {
+        payoutBps: Number(r[0]), minBet: r[1], maxBet: r[2],
+        minDur: Number(r[3]), maxDur: Number(r[4]), strikeDelay: Number(r[5])
+      };
+    });
   }
   function balanceOf(a) { return ethCall(NET.points, SEL.balanceOf + addr32(a)).then(function (h) { return BigInt(h); }); }
   function nativeBalance(a) { return rpc("eth_getBalance", [a, "latest"]).then(function (h) { return BigInt(h); }); } // INJ, for gas
   function allowance(o, s) { return ethCall(NET.points, SEL.allowance + addr32(o) + addr32(s)).then(function (h) { return BigInt(h); }); }
   // ---- house/vault reads ----
-  function houseStats() { return ethCall(NET.pool, SEL.houseStats).then(decodeStats); }
+  function houseStats() { return ethCall(NET.book, SEL.houseStats).then(decodeStats); }
   function vaultShares(a) { return ethCall(NET.vault, SEL.balanceOf + addr32(a)).then(function (h) { return BigInt(h); }); }
   function vaultMaxWithdraw(a) { return ethCall(NET.vault, SEL.maxWithdraw + addr32(a)).then(function (h) { return BigInt(h); }); }
 
@@ -142,15 +183,17 @@
     if (value) p.value = "0x" + BigInt(value).toString(16);
     return provider.request({ method: "eth_sendTransaction", params: [p] });
   }
-  function bet(provider, from, roundId, up, amountWei) { return tx(provider, from, NET.pool, SEL.bet + u256(roundId) + bool32(up) + u256(amountWei)); }
-  function claim(provider, from, roundId) { return tx(provider, from, NET.pool, SEL.claim + u256(roundId)); }
+  function openBet(provider, from, marketId, up, stakeWei, dur) {
+    return tx(provider, from, NET.book, SEL.openBet + u256(marketId) + bool32(up) + u256(stakeWei) + u256(dur));
+  }
+  function claim(provider, from, betId) { return tx(provider, from, NET.book, SEL.claim + u256(betId)); }
   function faucet(provider, from, amountWei) { return tx(provider, from, NET.points, SEL.faucet + u256(amountWei)); }
   function approve(provider, from, spender, amountWei) { return tx(provider, from, NET.points, SEL.approve + addr32(spender) + u256(amountWei)); }
   // LP: deposit points into the vault -> shares; withdraw points back out. approve points to NET.vault first.
   function vaultDeposit(provider, from, assetsWei) { return tx(provider, from, NET.vault, SEL.deposit + u256(assetsWei) + addr32(from)); }
   function vaultWithdraw(provider, from, assetsWei) { return tx(provider, from, NET.vault, SEL.withdraw + u256(assetsWei) + addr32(from) + addr32(from)); }
 
-  // ---- odds (house: FIXED payout per round from payoutBps, e.g. 19500 = 1.95x) ----
+  // ---- odds (FIXED payout from payoutBps, e.g. 19500 = 1.95x) ----
   function payout(payoutBps) { return payoutBps ? Number(payoutBps) / 10000 : 0; }
   function potentialWin(stakeWei, payoutBps) { return (stakeWei * BigInt(payoutBps || 0)) / 10000n; }
 
@@ -250,13 +293,16 @@
 
   // ---- public API ----
   window.PX = {
-    NET: NET,
-    boardSnapshot: boardSnapshot, myPositions: myPositions, balanceOf: balanceOf, allowance: allowance, nativeBalance: nativeBalance,
+    NET: NET, RESULT: RESULT,
+    markets: markets, marketsLength: marketsLength, bookConfig: bookConfig,
+    myPositions: myPositions, getPosition: getPosition, positionsLength: positionsLength, owed: owed, reserveFor: reserveFor,
+    balanceOf: balanceOf, allowance: allowance, nativeBalance: nativeBalance,
     houseStats: houseStats, vaultShares: vaultShares, vaultMaxWithdraw: vaultMaxWithdraw,
-    bet: bet, claim: claim, faucet: faucet, approve: approve,
+    openBet: openBet, claim: claim, faucet: faucet, approve: approve,
     vaultDeposit: vaultDeposit, vaultWithdraw: vaultWithdraw,
     payout: payout, potentialWin: potentialWin, toChips: toChips, chipsToWei: chipsToWei,
     explorerAddr: function (a) { return NET.explorer + "/address/" + a; },
+    explorerTx: function (t) { return NET.explorer + "/tx/" + t; },
     wallet: {
       list: walletList, connect: connect, restore: restore, disconnect: disconnect,
       ensureNetwork: ensureNetwork, currentChain: currentChain,

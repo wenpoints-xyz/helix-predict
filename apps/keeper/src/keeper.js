@@ -1,54 +1,60 @@
-// Keeper for PredictionHouse — BLOCK-DRIVEN.
+// Sweeper for PredictionBook — BLOCK-DRIVEN, per-bet.
 //
-// Subscribes to new blocks over WSS and fires the moment a round becomes eligible (first block whose
-// timestamp >= lockTime / expiryTime), instead of waiting on a slow poll. Reads + tx sends go over
-// HTTP (reliable); the socket is only a fast trigger. If the socket drops it reconnects, and a
-// fallback interval keeps ticking so the keeper never stalls.
+// No rounds. Each user opens their own position; the strike and close are pinned to FIXED PAST
+// instants (strikeInstant = openTime+Δ, closeInstant = strikeInstant+dur). Once a bet matures
+// (now >= closeInstant) anyone may settle it, and the settler earns a tip carved from the escrow.
+// This keeper is that settler: it watches new blocks, asks the book which bets are matured, fetches
+// the two historical Pyth updates from Hermes, and settles them in one settleMany() tx.
 //
-//   new block ──► tick ──► per market:
-//     (none/Settled) --createRound--> [Open] --lock(Pyth)--> [Locked] --settle(Pyth)--> [Settled] -> ...
-//                                        │  \                     │
-//                                        │   \ no bets at lockTime -> roll to next slot, NO Pyth fee
-//                               expiry+grace lapsed ─── voidExpired ──► refund (funds never lock)
+//   new block ──► sweep:
+//     book.pendingSettlement(cursor,PAGE)  ──► [ {betId, feedId, strikeInstant, dur}, ... ]
+//        for each matured bet: strikeData = hermes(strikeInstant) ; closeData = hermes(closeInstant)
+//     settleMany(betIds[], strikeData[][], closeData[][])   (skip-not-revert; tip → this keeper)
+//        └─ a bet whose Pyth history is unfetchable AND past settleGrace ──► voidExpired (refund)
 //
-// Idle cost: an empty round (nobody bet) never pays a Pyth fee — it's orphaned (0 stake, 0 reserve)
-// and the market rolls forward. Only rounds with real bets get locked+settled on-chain. Injective
-// gives no receipt, so we never await tx.wait(); a per-market cooldown dedupes sends across blocks.
+// Because settlement reads FIXED PAST prices, there is no lock latency: the price is history by the
+// time we settle, so the contract and the frontend read the identical value. Injective gives no tx
+// receipt, so we never await tx.wait(); a per-bet cooldown dedupes sends across consecutive blocks.
 //
-// Env: RPC_URL, WSS_URL, HOUSE_ADDR, KEEPER_PRIVATE_KEY|KEEPER_MNEMONIC,
-//      [HERMES_URL, LEAD_SEC, FALLBACK_MS, ACTION_COOLDOWN, GAS_LIMIT]
-// Flags: --once (single tick then exit)
+// Liveness note: settling a loser earns a tip but costs gas + a Pyth fee; at low volume the tip may
+// not cover cost, so THIS KEEPER IS SUBSIDISED — fund its key with INJ and run it always-on. Do not
+// rely on purely permissionless third parties for liveness.
+//
+// Env: RPC_URL, WSS_URL, BOOK_ADDR, KEEPER_PRIVATE_KEY|KEEPER_MNEMONIC,
+//      [HERMES_URL, PAGE, MAX_SETTLE, FALLBACK_MS, ACTION_COOLDOWN, GAS_LIMIT, FEE_BUFFER_BPS]
+// Flags: --once (single sweep then exit)
 
 import { ethers } from "ethers";
 import WebSocket from "ws";
 
 const RPC_URL = req("RPC_URL");
 const WSS_URL = process.env.WSS_URL || "wss://k8s.testnet.ws.injective.network/";
-const HOUSE_ADDR = req("HOUSE_ADDR");
+const BOOK_ADDR = req("BOOK_ADDR");
 const HERMES = (process.env.HERMES_URL || "https://hermes.pyth.network").replace(/\/$/, "");
-const LEAD = num("LEAD_SEC", 8); // seconds ahead to set a new round's lockTime
-const FALLBACK_MS = num("FALLBACK_MS", 6000); // tick this often even if the socket is quiet/down
-const ACTION_COOLDOWN = num("ACTION_COOLDOWN", 4); // don't re-act on a market within this many seconds
-const GAS_LIMIT = BigInt(process.env.GAS_LIMIT || "2500000");
+const PAGE = num("PAGE", 500); // positions scanned per pendingSettlement call
+const MAX_SETTLE = num("MAX_SETTLE", 20); // max bets per settleMany tx (bounds gas)
+const FALLBACK_MS = num("FALLBACK_MS", 6000); // sweep this often even if the socket is quiet/down
+const ACTION_COOLDOWN = num("ACTION_COOLDOWN", 6); // don't re-send a bet within this many seconds
+const GAS_LIMIT = BigInt(process.env.GAS_LIMIT || "6000000");
+const FEE_BUFFER_BPS = num("FEE_BUFFER_BPS", 500); // pad the update fee 5% (contract refunds leftover)
 const ONCE = process.argv.includes("--once");
 
-const HOUSE_ABI = [
-  "function boardSnapshot() view returns (tuple(uint256 marketId, bytes32 feedId, uint32 timeframe, bool marketEnabled, bool hasRound, uint256 roundId, uint64 lockTime, uint64 expiryTime, int64 strike, int64 close, uint128 upPool, uint128 downPool, uint32 payoutBps, uint8 state, bool upWon, bool voided)[])",
+const BOOK_ABI = [
+  "function pendingSettlement(uint256 start, uint256 max) view returns (tuple(uint256 betId, bytes32 feedId, uint64 strikeInstant, uint64 dur)[] list, uint256 nextCursor)",
+  "function positionsLength() view returns (uint256)",
   "function settleGrace() view returns (uint64)",
   "function pyth() view returns (address)",
-  "function createRound(uint256 marketId, uint64 lockTime) returns (uint256)",
-  "function lock(uint256 roundId, bytes[] updateData) payable",
-  "function settle(uint256 roundId, bytes[] updateData) payable",
-  "function voidExpired(uint256 roundId)"
+  "function settle(uint256 betId, bytes[] strikeData, bytes[] closeData) payable",
+  "function settleMany(uint256[] betIds, bytes[][] strikeData, bytes[][] closeData) payable",
+  "function voidExpired(uint256 betId)"
 ];
 const PYTH_ABI = ["function getUpdateFee(bytes[] updateData) view returns (uint256)"];
-const State = { Open: 0, Locked: 1, Settled: 2 };
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = makeWallet();
-const house = new ethers.Contract(HOUSE_ADDR, HOUSE_ABI, wallet);
+const book = new ethers.Contract(BOOK_ADDR, BOOK_ABI, wallet);
 let pyth;
-let grace = 3600; // cached settleGrace; refreshed at startup
+let grace = 3600; // cached settleGrace, refreshed at startup
 
 // ---- nonce (never await receipts on Injective; manage locally) ----
 let localNonce = null;
@@ -60,25 +66,46 @@ function resyncNonce() {
   localNonce = null;
 }
 
-// ---- per-market cooldown: don't re-send while the last tx is still in flight ----
-const actedAt = {};
-function recentlyActed(mid, now) {
-  return actedAt[mid] && now - actedAt[mid] < ACTION_COOLDOWN;
+// ---- per-bet cooldown: don't re-send a bet while its settle tx is still in flight ----
+const sentAt = {};
+function recentlySent(betId, now) {
+  return sentAt[betId] && now - sentAt[betId] < ACTION_COOLDOWN;
 }
-function markActed(mid) {
-  actedAt[mid] = Math.floor(Date.now() / 1000);
+function markSent(betId) {
+  sentAt[betId] = Math.floor(Date.now() / 1000);
 }
 
-async function pythUpdate(feedId) {
+// Fetch the signed Pyth update whose publishTime is the first tick at/after T (Hermes historical).
+// The book's Unique read pins min = the bet's instant, so this exact update satisfies it.
+async function hermesAt(feedId, t) {
   const id = feedId.startsWith("0x") ? feedId.slice(2) : feedId;
-  const url = `${HERMES}/v2/updates/price/latest?ids[]=0x${id}&encoding=hex`;
-  const r = await fetch(url, { signal: AbortSignal.timeout(3000) }); // never hang the loop on Hermes
-  if (!r.ok) throw new Error(`hermes ${r.status}`);
+  const url = `${HERMES}/v2/updates/price/${t}?ids[]=0x${id}&encoding=hex`;
+  const r = await fetch(url, { signal: AbortSignal.timeout(4000) });
+  if (!r.ok) throw new Error(`hermes ${r.status} @${t}`);
   const j = await r.json();
   const data = j?.binary?.data;
-  if (!Array.isArray(data) || !data.length) throw new Error("hermes: no update data");
-  const publishTime = Number(j?.parsed?.[0]?.price?.publish_time || 0);
-  return { data: data.map((h) => (h.startsWith("0x") ? h : "0x" + h)), publishTime };
+  if (!Array.isArray(data) || !data.length) throw new Error(`hermes: no data @${t}`);
+  return data.map((h) => (h.startsWith("0x") ? h : "0x" + h));
+}
+
+// Collect every matured, unsettled bet by paging the book's keeper view.
+async function pendingAll(len) {
+  const out = [];
+  let cursor = 0;
+  while (cursor < len) {
+    const [list, next] = await book.pendingSettlement(cursor, PAGE);
+    for (const p of list) {
+      out.push({
+        betId: p.betId,
+        feedId: p.feedId,
+        strikeInstant: Number(p.strikeInstant),
+        dur: Number(p.dur)
+      });
+    }
+    cursor = Number(next);
+    if (next <= 0n && cursor === 0) break; // safety
+  }
+  return out;
 }
 
 async function send(label, fn) {
@@ -92,112 +119,78 @@ async function send(label, fn) {
   }
 }
 
-// Open the next round. Cadence: while the chain is live open exactly the next slot (= this round's
-// expiry); after a settled/lapsed round restart genesis-style a short lead ahead.
-function createNext(m, now) {
-  const mid = Number(m.marketId);
-  const expT = Number(m.expiryTime);
-  const target = m.hasRound && expT > now ? expT : now + LEAD;
-  return send(`createRound m${mid} @${target}`, (nonce) =>
-    house.createRound(mid, target, { nonce, gasLimit: GAS_LIMIT })
-  );
-}
-
-// One in-flight lock/settle attempt per market: the Hermes fetch is async, so without this two
-// consecutive blocks could both fetch + fire, double-sending (the 2nd reverts NotOpen).
-const inFlight = {};
-async function lockOrSettle(kind, mid, rid, feedId, minPublishTime) {
-  if (inFlight[mid]) return;
-  inFlight[mid] = true;
+let sweeping = false;
+async function sweep(nowTs) {
+  if (sweeping) return; // one sweep at a time (the read + Hermes fan-out)
+  sweeping = true;
   try {
-    let upd;
-    try {
-      upd = await pythUpdate(feedId);
-    } catch (e) {
-      return log(`${kind} r${rid} skip: ${short(e)}`);
+    const now = nowTs || Math.floor(Date.now() / 1000);
+    const len = Number(await book.positionsLength());
+    if (len === 0) return;
+    const pending = await pendingAll(len);
+    if (!pending.length) return;
+
+    const batch = [];
+    for (const b of pending) {
+      if (batch.length >= MAX_SETTLE) break;
+      if (recentlySent(b.betId, now)) continue; // let the last tx land
+      batch.push(b);
     }
-    // Pyth/Hermes lags wall-clock by a couple seconds, and lock()/settle() REQUIRE the price's
-    // publishTime >= the window (lockTime / expiryTime). Sending an older price just reverts
-    // (PriceBeforeWindow) and burns gas + a cooldown, then retries. Instead, wait (retry next
-    // block) until Hermes has caught up past the window, then send once — the real fix for latency.
-    if (upd.publishTime < minPublishTime) return;
-    markActed(mid); // only now (we're actually sending) so the waiting blocks keep retrying
-    const fee = await pyth.getUpdateFee(upd.data);
-    await send(`${kind} r${rid}`, (nonce) =>
-      house[kind](rid, upd.data, { value: fee, nonce, gasLimit: GAS_LIMIT })
-    );
-  } finally {
-    inFlight[mid] = false;
-  }
-}
+    if (!batch.length) return;
 
-async function handleMarket(m, now) {
-  if (!m.marketEnabled) return;
-  const mid = Number(m.marketId);
-  if (recentlyActed(mid, now)) return; // let the last tx land first
-  const st = Number(m.state);
-  const lockT = Number(m.lockTime);
-  const expT = Number(m.expiryTime);
-  const rid = m.roundId;
-  const hasBets = m.upPool > 0n || m.downPool > 0n;
-  const voidExp = () => send(`voidExpired r${rid}`, (n) => house.voidExpired(rid, { nonce: n, gasLimit: GAS_LIMIT }));
-
-  // no round yet, or the last real game settled -> open a fresh one
-  if (!m.hasRound || st === State.Settled) {
-    markActed(mid);
-    return createNext(m, now);
-  }
-
-  if (st === State.Open) {
-    // EMPTY round: never spend a Pyth fee on it. Once betting closes, roll to the next slot
-    // (the empty round is harmlessly orphaned: 0 stake, 0 reserve, off the board).
-    if (!hasBets) {
-      if (now >= lockT) {
-        markActed(mid);
-        return createNext(m, now);
+    // Fetch the two historical updates per bet (strike instant + close instant), in parallel.
+    const built = [];
+    for (const b of batch) {
+      try {
+        const [strikeData, closeData] = await Promise.all([
+          hermesAt(b.feedId, b.strikeInstant),
+          hermesAt(b.feedId, b.strikeInstant + b.dur)
+        ]);
+        built.push({ betId: b.betId, strikeData, closeData, bet: b });
+      } catch (e) {
+        // Hermes gap: if the bet is past grace it can never settle -> void it (refund) instead.
+        if (now >= b.strikeInstant + b.dur + grace) {
+          markSent(b.betId);
+          await send(`voidExpired ${b.betId}`, (nonce) =>
+            book.voidExpired(b.betId, { nonce, gasLimit: GAS_LIMIT })
+          );
+        } else {
+          log(`skip ${b.betId}: ${short(e)} (retry next block)`);
+        }
       }
-      return; // still open for bets
     }
-    // real game (someone bet vs the house) -> lock on Pyth the first eligible block
-    if (now >= expT + grace) {
-      markActed(mid);
-      return voidExp();
-    }
-    if (now >= lockT) return lockOrSettle("lock", mid, rid, m.feedId, lockT); // marks acted only on the actual send
-    return; // still taking bets
-  }
+    if (!built.length) return;
 
-  if (st === State.Locked) {
-    if (now >= expT + grace) {
-      markActed(mid);
-      return voidExp();
+    // Sum the exact update fees, pad a touch (the contract refunds any leftover).
+    let fee = 0n;
+    for (const x of built) {
+      const [fs, fc] = await Promise.all([
+        pyth.getUpdateFee(x.strikeData),
+        pyth.getUpdateFee(x.closeData)
+      ]);
+      fee += fs + fc;
     }
-    if (now >= expT) return lockOrSettle("settle", mid, rid, m.feedId, expT);
-    return; // waiting for expiry
-  }
-}
+    fee = fee + (fee * BigInt(FEE_BUFFER_BPS)) / 10000n;
 
-let reading = false;
-async function tick(blockTs) {
-  if (reading) return; // guard ONLY the fast board read
-  reading = true;
-  const now = blockTs || Math.floor(Date.now() / 1000);
-  let board;
-  try {
-    board = await house.boardSnapshot();
+    const betIds = built.map((x) => x.betId);
+    const sData = built.map((x) => x.strikeData);
+    const cData = built.map((x) => x.closeData);
+    for (const id of betIds) markSent(id);
+
+    if (betIds.length === 1) {
+      await send(`settle ${betIds[0]}`, (nonce) =>
+        book.settle(betIds[0], sData[0], cData[0], { value: fee, nonce, gasLimit: GAS_LIMIT })
+      );
+    } else {
+      await send(`settleMany x${betIds.length}`, (nonce) =>
+        book.settleMany(betIds, sData, cData, { value: fee, nonce, gasLimit: GAS_LIMIT })
+      );
+    }
   } catch (e) {
-    reading = false;
-    return log(`read error: ${short(e)}`);
-  }
-  reading = false;
-  // Fire per-market actions WITHOUT awaiting. handleMarket sets the per-market cooldown synchronously
-  // before any await, so a slow Hermes/broadcast on one market can never stall the next block's tick
-  // (that global-await stall is what pinned reactions to the fallback interval).
-  for (const m of board) {
-    handleMarket(m, now).catch((e) => {
-      resyncNonce();
-      log(`market ${m.marketId} error: ${short(e)}`);
-    });
+    resyncNonce();
+    log(`sweep error: ${short(e)}`);
+  } finally {
+    sweeping = false;
   }
 }
 
@@ -243,21 +236,21 @@ function startBlockFeed(onBlock) {
 }
 
 async function main() {
-  pyth = new ethers.Contract(await house.pyth(), PYTH_ABI, provider);
-  grace = Number(await house.settleGrace());
-  log(`keeper up (block-driven): house=${HOUSE_ADDR} signer=${wallet.address} ws=${WSS_URL} lead=${LEAD}s grace=${grace}s once=${ONCE}`);
+  pyth = new ethers.Contract(await book.pyth(), PYTH_ABI, provider);
+  grace = Number(await book.settleGrace());
+  log(`sweeper up (block-driven): book=${BOOK_ADDR} signer=${wallet.address} ws=${WSS_URL} grace=${grace}s once=${ONCE}`);
 
   if (ONCE) {
-    await tick();
+    await sweep();
     return;
   }
   let lastBlock = 0;
-  startBlockFeed((num, ts) => {
-    if (num <= lastBlock) return; // ignore dupes/reorgs going backwards
-    lastBlock = num;
-    tick(ts);
+  startBlockFeed((numBlk, ts) => {
+    if (numBlk <= lastBlock) return; // ignore dupes/reorgs going backwards
+    lastBlock = numBlk;
+    sweep(ts);
   });
-  setInterval(() => tick(), FALLBACK_MS); // belt-and-suspenders if the socket is quiet/down
+  setInterval(() => sweep(), FALLBACK_MS); // belt-and-suspenders if the socket is quiet/down
 }
 
 // ---- helpers ----
