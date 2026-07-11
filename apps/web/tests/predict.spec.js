@@ -20,7 +20,7 @@ const SEL = {
   payoutBps: "0x020f09b7", minBet: "0x9619367d", maxBet: "0x2e5b2168",
   minDur: "0x67b38200", maxDur: "0xeab50bd2", strikeDelay: "0x51fd4c2a",
   positionsOf: "0xdc9d54ef", getPosition: "0xeb02c301", owed: "0xb1276604", settleGrace: "0x12ae6491",
-  voidExpired: "0xb04fe3fa",
+  voidExpired: "0xb04fe3fa", tipBps: "0xe79ce788", maxTip: "0x7b45eb36",
   balanceOf: "0x70a08231", allowance: "0xdd62ed3e",
   openBet: "0x058a345d", claim: "0x379607f5", faucet: "0x57915897", approve: "0x095ea7b3",
   houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77"
@@ -50,7 +50,7 @@ async function setup(page, opts) {
   opts = Object.assign({
     ids: [], pos: {}, balance: 0n, allowance: 0n, shares: 0n, owed: 0n,
     stats: houseStats(0n, 0n, 0n, 0n),
-    cfg: { payoutBps: 19500, minBet: E18, maxBet: 2000n * E18, minDur: 5, maxDur: 300, strikeDelay: 3, settleGrace: 3600 }
+    cfg: { payoutBps: 19500, minBet: E18, maxBet: 2000n * E18, minDur: 5, maxDur: 300, strikeDelay: 3, settleGrace: 3600, tipBps: 100, maxTip: 5n * E18 }
   }, opts);
   let allowCalls = 0;
   await page.route((url) => url.host.includes("k8s.testnet.json-rpc"), async (route) => {
@@ -69,6 +69,8 @@ async function setup(page, opts) {
       else if (sel === SEL.maxDur) result = "0x" + u(opts.cfg.maxDur);
       else if (sel === SEL.strikeDelay) result = "0x" + u(opts.cfg.strikeDelay);
       else if (sel === SEL.settleGrace) result = "0x" + u(opts.cfg.settleGrace);
+      else if (sel === SEL.tipBps) result = "0x" + u(opts.cfg.tipBps);
+      else if (sel === SEL.maxTip) result = "0x" + u(opts.cfg.maxTip);
       else if (sel === SEL.positionsOf) result = positionsOf(opts.ids);
       else if (sel === SEL.getPosition) { const gid = Number(lastWord(data)); result = position((opts.byId && opts.byId[gid]) || opts.pos); }
       else if (sel === SEL.owed) { const oid = Number(lastWord(data)); result = "0x" + u(opts.owedById ? (opts.owedById[oid] || 0n) : opts.owed); }
@@ -261,6 +263,26 @@ test("pending strip: a bet past grace shows REFUND and fires voidExpired()", asy
   await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.voidExpired);
   const txs = await sent(page);
   expect(txs.find((t) => t.sel === SEL.voidExpired).to).toBe(BOOK);
+});
+
+test("my stats modal: net P&L, win rate, record from positionsOf", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, {
+    ids: [1, 2],
+    byId: {
+      1: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, payoutBps: 19500, strikeInstant: now - 100, dur: 15, strike: 100, close: 200 }, // WIN: net = 195 - 1(tip) - 100 = +94
+      2: { bettor: ACCT, marketId: 1, up: false, result: 2, stake: 50n * E18, payoutBps: 19500, strikeInstant: now - 200, dur: 30, strike: 200, close: 300 } // LOSS: -50
+    }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await page.click("#statsbtn");
+  const m = page.locator("#statsmodal");
+  await expect(m.getByText("MY STATS")).toBeVisible();
+  await expect(m.getByText("NET P&L")).toBeVisible();
+  await expect(m.getByText("+44", { exact: false })).toBeVisible(); // 94 win − 50 loss
+  await expect(m.getByText("1W 1L 0V")).toBeVisible();
+  await expect(m.getByText("50%")).toBeVisible();
 });
 
 test("bet history modal: lists results and claims an unclaimed win", async ({ page }) => {
