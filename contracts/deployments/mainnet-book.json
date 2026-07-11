@@ -1,0 +1,35 @@
+{
+  "network": "injective-evm-mainnet",
+  "chainId": 1776,
+  "rpc": "https://sentry.evm-rpc.injective.network/",
+  "explorer": "https://blockscout.injective.network",
+  "deployedAt": "2026-07-11",
+  "deployer": "0x68D85663DaE6Aed5F102b7ec1f5551b890Ce1db3",
+  "stack": "book",
+  "audited": "audit-fixes-2 merged to main (commit 38d7fa5); 4-auditor review + 2 re-audit rounds, 89 tests, invariants green",
+  "contracts": {
+    "PredictionBook": "0x98121Af94Ece69bFEC46544ff0Fc202F30010956",
+    "HouseVault": "0x67bf550106dD010Fd071cfd156070bF23352f7cB",
+    "stakeToken_HELIXPOINT": "0xAB3cc28e85056D5AB8f858F322a06AA6f9Eb64BD",
+    "pyth": "0x36825bf3Fbdf5a29E2d5148bfe7Dcf7B5639e320"
+  },
+  "config": {
+    "payoutBps": 19500,
+    "maxBetExposureBps": 500,
+    "maxAggExposureBps": 3000,
+    "minBet": "1e18",
+    "maxBet": "5000000e18",
+    "maxConfBps": 200,
+    "tipBps": 100,
+    "maxTip": "1000e18",
+    "maxOpenPerUser": 25,
+    "minDur": 5,
+    "maxDur": 300,
+    "strikeDelay": 3,
+    "settleTol": 5,
+    "settleGrace": 3600
+  },
+  "markets": "BTC/ETH/INJ (ids 0/1/2, enabled). All params owner-tunable via setParams/setGuards.",
+  "seed": "NONE — deployer holds no HELIXPOINT; operator is first LP. OFFSET=6 protects first depositor.",
+  "note": "Vault totalAssets=0 until operator LPs HELIXPOINT. Keeper must be repointed to mainnet + this book address. Frontend prod config not yet flipped live (needs mainnet faucet/points UX adaptation)."
+}
