@@ -256,8 +256,13 @@
     box.innerHTML = "<div style='font-family:var(--comic);font-weight:bold;color:var(--accent-2);margin-bottom:8px'>Pick a wallet</div>";
     list.forEach(function (w) {
       var b = document.createElement("button");
-      b.className = "getpts"; b.style.cssText = "display:block;width:100%;text-align:left;margin:4px 0";
-      b.textContent = w.name;
+      b.className = "getpts"; b.style.cssText = "display:flex;align-items:center;gap:8px;width:100%;text-align:left;margin:4px 0";
+      if (w.icon) {
+        var im = document.createElement("img");
+        im.src = w.icon; im.width = 18; im.height = 18; im.alt = "";
+        b.appendChild(im);
+      }
+      b.appendChild(document.createTextNode(w.name));
       b.onclick = function () { document.body.removeChild(ov); doConnect(w.provider); };
       box.appendChild(b);
     });
@@ -357,9 +362,10 @@
 
   /* ---------- LP vault: "be the house" ---------- */
   var lpShown = false;
+  el.lp.style.display = "none"; // .histbar's display:flex overrides [hidden] — toggle display directly
   el.lpToggle.onclick = function () {
     lpShown = !lpShown;
-    el.lp.hidden = !lpShown;
+    el.lp.style.display = lpShown ? "flex" : "none";
     el.lpToggle.textContent = (lpShown ? "▾" : "▸") + " BE THE HOUSE";
     if (lpShown) refreshLp();
   };

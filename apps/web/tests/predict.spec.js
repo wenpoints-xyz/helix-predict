@@ -263,3 +263,26 @@ test("regression: non-empty round past lockTime still shows the pending-lock vie
   await page.goto("/");
   await expect(page.locator("#phase")).toHaveText(/LOCKING/);
 });
+
+/* ---------- LP toggle, wallet persistence, dead chrome ---------- */
+
+test("BE THE HOUSE toggles the LP panel (hidden by default)", async ({ page }) => {
+  await setup(page, {});
+  await page.goto("/");
+  await expect(page.locator("#lp")).toBeHidden();          // .histbar display:flex must not defeat the default
+  await page.click("#lpToggle");
+  await expect(page.locator("#lp")).toBeVisible();
+  await expect(page.locator("#lpToggle")).toHaveText(/▾/);
+  await page.click("#lpToggle");
+  await expect(page.locator("#lp")).toBeHidden();
+  expect(await page.locator('[title="close (lol)"]').count()).toBe(0); // decorative ✕ removed
+});
+
+test("wallet connection survives a reload (silent reconnect)", async ({ page }) => {
+  await setup(page, {});
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#connect")).toContainText("0xAbC0");
+  await page.reload();
+  await expect(page.locator("#connect")).toContainText("0xAbC0"); // no click — restored from localStorage
+});
