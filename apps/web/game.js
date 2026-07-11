@@ -39,7 +39,7 @@
   var wrap = $("chartwrap");
   var el = { rid: $("rid"), phase: $("phase"), clock: $("clock"), bal: $("bal"), hist: $("hist"),
              led: $("led"), px: $("px"), feedlbl: $("feedlbl"), getpts: $("getpts"),
-             connect: $("connect"), netbanner: $("netbanner"), dur: $("durbtn"),
+             connect: $("connect"), netbanner: $("netbanner"), dur: $("durbtn"), histbtn: $("histbtn"),
              pending: $("pending"), pendingMsg: $("pendingMsg"), pendingBtn: $("pendingBtn"),
              lp: $("lp"), lpToggle: $("lpToggle"), lpBank: $("lpBank"), lpMine: $("lpMine"),
              lpUtil: $("lpUtil"), lpAmt: $("lpAmt"), lpDep: $("lpDep"), lpWd: $("lpWd"), lpMsg: $("lpMsg") };
@@ -508,6 +508,73 @@
       .then(function () { el.lpMsg.textContent = "Withdrawn (only free, unreserved capital)."; el.lpAmt.value = ""; setTimeout(function () { refreshLp(); refreshBalance(); }, 2500); })
       .catch(function (e) { el.lpMsg.textContent = txErr(e, "Withdraw failed (capital may be backing open bets)."); });
   };
+
+  /* ---------- bet history (modal from the ☰ title-bar button) ---------- */
+  function histPrice(raw) { return raw ? fmt(Number(raw) * Math.pow(10, EXPO)) : "—"; }
+  function showHistory() {
+    var ov = document.createElement("div");
+    ov.id = "histmodal";
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(6,11,22,.82);display:flex;align-items:center;justify-content:center;z-index:9998;padding:16px";
+    var box = document.createElement("div");
+    box.style.cssText = "background:var(--panel);border:3px solid;border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt);min-width:300px;max-width:min(96vw,480px);max-height:82vh;display:flex;flex-direction:column";
+    var hd = document.createElement("div");
+    hd.style.cssText = "display:flex;align-items:center;gap:8px;padding:7px 10px;color:#fff;background:linear-gradient(90deg,var(--stripe-b),var(--stripe-a))";
+    hd.innerHTML = "<span style='flex:1;font-family:var(--comic);font-weight:bold'>YOUR BETS</span>";
+    var x = document.createElement("button"); x.className = "tbtn"; x.textContent = "×"; x.onclick = function () { document.body.removeChild(ov); };
+    hd.appendChild(x); box.appendChild(hd);
+    var list = document.createElement("div");
+    list.style.cssText = "overflow-y:auto;padding:6px 8px;font-family:var(--mono);font-size:12px";
+    box.appendChild(list);
+    if (!S.acct) list.innerHTML = "<div style='opacity:.7;padding:12px'>Connect a wallet to see your bets.</div>";
+    else if (!S.myBets.length) list.innerHTML = "<div style='opacity:.7;padding:12px'>No bets yet — tap UP or DOWN to play.</div>";
+    else renderHistoryRows(list);
+    ov.appendChild(box);
+    ov.onclick = function (e) { if (e.target === ov) document.body.removeChild(ov); };
+    document.body.appendChild(ov);
+  }
+  function renderHistoryRows(list) {
+    var now = Date.now(), winVoid = [];
+    S.myBets.forEach(function (p) {
+      var a = assetOf(p.marketId) || "?";
+      var dir = p.up ? "▲" : "▼", dcol = p.up ? "var(--ok)" : "var(--bad)";
+      var stake = Math.floor(PX.toChips(p.stake));
+      var status, scol, amt;
+      if (p.result === PX.RESULT.OPEN) {
+        var matured = now >= (p.strikeInstant + p.dur) * 1000;
+        status = matured ? "settling" : "live"; scol = "var(--accent-2)"; amt = stake + " @ risk";
+      } else if (p.result === PX.RESULT.WIN) {
+        status = "won"; scol = "var(--ok)";
+        amt = "+" + Math.floor(PX.toChips(p.stake) * p.payoutBps / 10000).toLocaleString("en-US"); winVoid.push(p.betId);
+      } else if (p.result === PX.RESULT.VOID) {
+        status = "void"; scol = "var(--ink-dim)"; amt = "refund " + stake.toLocaleString("en-US"); winVoid.push(p.betId);
+      } else { status = "lost"; scol = "var(--bad)"; amt = "-" + stake.toLocaleString("en-US"); }
+      var det = (p.strike && p.close) ? histPrice(p.strike) + "→" + histPrice(p.close) : (p.dur + "s");
+      var row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 2px;border-bottom:1px solid var(--bevel-dk)";
+      row.innerHTML =
+        "<span style='color:" + dcol + ";font-weight:bold;min-width:46px'>" + dir + " " + a + "</span>" +
+        "<span style='flex:1'><b>" + stake + "</b> pts <span style='opacity:.55'>" + det + "</span></span>" +
+        "<span style='color:" + scol + ";font-weight:bold;min-width:52px;text-align:right'>" + status + "</span>" +
+        "<span style='min-width:64px;text-align:right'>" + amt + "</span>";
+      var slot = document.createElement("span"); slot.style.cssText = "min-width:56px;text-align:right"; slot.dataset.bet = p.betId;
+      row.appendChild(slot); list.appendChild(row);
+    });
+    // only Win/Void can have unclaimed proceeds — read owed and drop a CLAIM button where >0
+    winVoid.slice(0, 25).forEach(function (id) {
+      PX.owed(id).then(function (w) {
+        if (w <= 0n) return;
+        var slot = list.querySelector('[data-bet="' + id + '"]'); if (!slot) return;
+        var b = document.createElement("button"); b.className = "getpts"; b.textContent = "CLAIM"; b.style.padding = "3px 6px";
+        b.onclick = function () {
+          b.disabled = true; b.textContent = "…";
+          PX.claim(PX.wallet.provider, S.acct, id).then(function () { b.textContent = "✓"; setTimeout(poll, 2500); })
+            .catch(function (e) { b.disabled = false; b.textContent = "CLAIM"; toast(txErr(e, "Claim failed.")); });
+        };
+        slot.appendChild(b);
+      }).catch(function () {});
+    });
+  }
+  el.histbtn.onclick = showHistory;
 
   /* ---------- flying points ---------- */
   function flyPoints(text, color, side) {

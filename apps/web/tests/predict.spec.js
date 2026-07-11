@@ -70,8 +70,8 @@ async function setup(page, opts) {
       else if (sel === SEL.strikeDelay) result = "0x" + u(opts.cfg.strikeDelay);
       else if (sel === SEL.settleGrace) result = "0x" + u(opts.cfg.settleGrace);
       else if (sel === SEL.positionsOf) result = positionsOf(opts.ids);
-      else if (sel === SEL.getPosition) result = position(opts.pos);
-      else if (sel === SEL.owed) result = "0x" + u(opts.owed);
+      else if (sel === SEL.getPosition) { const gid = Number(lastWord(data)); result = position((opts.byId && opts.byId[gid]) || opts.pos); }
+      else if (sel === SEL.owed) { const oid = Number(lastWord(data)); result = "0x" + u(opts.owedById ? (opts.owedById[oid] || 0n) : opts.owed); }
       else if (sel === SEL.houseStats) result = opts.stats;
       else if (sel === SEL.maxWithdraw) result = "0x" + u(opts.shares);
       else if (sel === SEL.balanceOf) result = "0x" + u(to === VAULT ? opts.shares : opts.balance);
@@ -261,6 +261,30 @@ test("pending strip: a bet past grace shows REFUND and fires voidExpired()", asy
   await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.voidExpired);
   const txs = await sent(page);
   expect(txs.find((t) => t.sel === SEL.voidExpired).to).toBe(BOOK);
+});
+
+test("bet history modal: lists results and claims an unclaimed win", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, {
+    ids: [6, 7],
+    byId: {
+      6: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, payoutBps: 19500, strikeInstant: now - 90, dur: 15, strike: 100, close: 200 }, // WON
+      7: { bettor: ACCT, marketId: 1, up: false, result: 2, stake: 25n * E18, payoutBps: 19500, strikeInstant: now - 200, dur: 30, strike: 200, close: 300 } // LOST
+    },
+    owedById: { 6: 195n * E18, 7: 0n }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await page.click("#histbtn");
+  const modal = page.locator("#histmodal");
+  await expect(modal.getByText("won", { exact: true })).toBeVisible();
+  await expect(modal.getByText("lost", { exact: true })).toBeVisible();
+  const claim = modal.getByRole("button", { name: "CLAIM" });
+  await expect(claim).toBeVisible();
+  await claim.click();
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.claim);
+  const txs = await sent(page);
+  expect(txs.find((t) => t.sel === SEL.claim).to).toBe(BOOK);
 });
 
 test("LP panel: shows bankroll from houseStats and deposits to the vault", async ({ page }) => {
