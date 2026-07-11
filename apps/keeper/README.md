@@ -37,7 +37,24 @@ so it can't read other services' `.env` files or the deployer key. A separate po
 (trusted `main` only, CI-green) rebuilds the repo and restarts this service — the keeper box
 never runs a GitHub daemon.
 
-## Mainnet
+## Two keepers: testnet + mainnet (run BOTH)
 
-Point `HOUSE_ADDR` at the mainnet house and use a dedicated `KEEPER_PRIVATE_KEY` (never the
-deployer mnemonic). Mainnet deploys require explicit authorization.
+The keeper is fully env-driven, so testnet and mainnet run as two separate systemd units of the
+**same code**, differing only by `EnvironmentFile`:
+
+| unit | network | env file | book |
+|------|---------|----------|------|
+| `helix-keeper.service`         | TESTNET (1439) | `.env`         | testnet PredictionBook |
+| `helix-keeper-mainnet.service` | MAINNET (1776) | `.env.mainnet` | `0x98121Af94Ece69bFEC46544ff0Fc202F30010956` |
+
+Install the mainnet one alongside the testnet one:
+
+```bash
+cp .env.mainnet.example /opt/helix-predict/apps/keeper/.env.mainnet   # fill KEEPER_PRIVATE_KEY, chmod 600
+cp helix-keeper-mainnet.service /etc/systemd/system/
+systemctl enable --now helix-keeper-mainnet
+```
+
+The mainnet keeper idles (nothing to settle) until the vault is LP-funded and bets are opened.
+Same keeper wallet funds both chains; never use the deployer mnemonic. Mainnet stake is real
+$HELIXPOINT — see `contracts/deployments/mainnet-book.json`.

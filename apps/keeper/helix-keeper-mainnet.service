@@ -1,0 +1,28 @@
+# ===== MAINNET keeper (chainid 1776) =====
+# Runs the SAME keeper code (src/keeper.js) as helix-keeper.service, but against Injective MAINNET.
+# The ONLY difference is EnvironmentFile: this one reads .env.mainnet (mainnet RPC/WSS + the mainnet
+# PredictionBook 0x98121Af94Ece69bFEC46544ff0Fc202F30010956). The testnet keeper (helix-keeper.service)
+# reads .env. Both run concurrently under the same helixkeeper user; they settle different chains and
+# never share state. Keeper wallet (from KEEPER_PRIVATE_KEY) is funded with INJ on BOTH chains.
+[Unit]
+Description=helix-predict keeper — MAINNET (PredictionBook settle sweeper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=helixkeeper
+Group=helixkeeper
+WorkingDirectory=/opt/helix-predict/apps/keeper
+EnvironmentFile=/opt/helix-predict/apps/keeper/.env.mainnet
+ExecStart=/usr/local/bin/node src/keeper.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/helix-predict/apps/keeper
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,9 @@
+# ===== TESTNET keeper (chainid 1439) =====
+# This unit runs the keeper against Injective TESTNET (EnvironmentFile=.env).
+# The MAINNET keeper is a SEPARATE unit: helix-keeper-mainnet.service (EnvironmentFile=.env.mainnet).
+# Same code (src/keeper.js), different env only. Run BOTH concurrently — they never share state.
 [Unit]
-Description=helix-predict keeper (PredictionHouse rounds: create/lock/settle/void)
+Description=helix-predict keeper — TESTNET (PredictionBook settle sweeper)
 After=network-online.target
 Wants=network-online.target
 
