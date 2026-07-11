@@ -81,7 +81,7 @@ async function setup(page, opts) {
     else if (req.method === "eth_getBalance") result = "0x" + (10n ** 18n).toString(16); // 1 INJ gas
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ jsonrpc: "2.0", id: req.id, result }) });
   });
-  await page.addInitScript(({ ACCT, FEEDS }) => {
+  await page.addInitScript(({ ACCT, FEEDS, PT }) => {
     const cbs = {}; window.__sent = [];
     window.ethereum = {
       isMetaMask: true,
@@ -97,13 +97,14 @@ async function setup(page, opts) {
     window.EventSource = class {
       constructor() {
         setTimeout(() => {
-          const arr = Object.keys(FEEDS).map((a) => ({ id: FEEDS[a], price: { price: P[FEEDS[a]], expo: -8, publish_time: Math.floor(Date.now() / 1000) } }));
+          const pt = PT != null ? PT : Math.floor(Date.now() / 1000);
+          const arr = Object.keys(FEEDS).map((a) => ({ id: FEEDS[a], price: { price: P[FEEDS[a]], expo: -8, publish_time: pt } }));
           if (this.onmessage) this.onmessage({ data: JSON.stringify({ parsed: arr }) });
         }, 30);
       }
       close() {}
     };
-  }, { ACCT, FEEDS });
+  }, { ACCT, FEEDS, PT: opts.pt != null ? opts.pt : null });
 }
 const sent = (page) => page.evaluate(() => window.__sent.map((t) => ({ to: (t.to || "").toLowerCase(), sel: (t.data || "").slice(0, 10) })));
 async function upZoneClick(page) {
@@ -189,6 +190,21 @@ test("an active position renders BET #<id> and its phase", async ({ page }) => {
   await page.goto("/");
   await page.click("#connect");
   await expect(page.locator("#rid")).toHaveText("BET #4");
+});
+
+test("strike shows LOCKING… (not a jumpy number) until the exact tick confirms", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  // strikeInstant has passed, but the only streamed tick is STALE (pt before strikeInstant), so the
+  // exact strike hasn't arrived -> the HUD must read LOCKING…, never a premature/jumpy price.
+  await setup(page, {
+    pt: now - 100,
+    ids: [8],
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 0, stake: 25n * E18, reserve: 24n * E18, strikeInstant: now - 5, dur: 60 }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#rid")).toHaveText("BET #8");
+  await expect(page.locator("#phase")).toHaveText(/LOCKING…/);
 });
 
 test("LP panel: shows bankroll from houseStats and deposits to the vault", async ({ page }) => {

@@ -25,7 +25,7 @@
     stake: parseInt(localStorage.predict_stake || "25", 10) || 25,
     dur: parseInt(localStorage.predict_dur || "15", 10) || 15,
     bal: null, acct: null, cfg: null, markets: {},
-    feeds: {}, active: {}, myBets: [], seen: {}, claiming: {}, pendingOpen: {}, provStrike: {}, hist: {},
+    feeds: {}, active: {}, myBets: [], seen: {}, claiming: {}, pendingOpen: {}, provStrike: {}, finishT: {}, hist: {},
     muted: localStorage.predict_mute === "1",
     hover: null, press: null, flash: null,
     feedMode: "live", lastAnyTick: Date.now()
@@ -138,13 +138,30 @@
     for (var i = 0; i < f.samples.length; i++) if (f.samples[i].pt && f.samples[i].pt >= sec) return f.samples[i].p;
     return null;
   }
+  // The exact strike is the first Pyth tick with publish_time >= strikeInstant, but Hermes lags
+  // wall-clock ~1-2s so that tick hasn't streamed in yet at lock time. We show the on-screen price
+  // provisionally and GLIDE it onto the exact value once the tick lands (easeStrikes) — no jump.
+  // Status stays "locking" until the glide has settled onto the confirmed value, then "locked".
   function strikeOf(pos, f, now) {
     if (pos.strike) return { p: Number(pos.strike) * Math.pow(10, EXPO), status: "locked" }; // on-chain (set at settle)
     if (now / 1000 < pos.strikeInstant) return { p: null, status: "arming" };
+    var shown = S.provStrike[pos.betId];
+    if (shown == null) shown = f.disp; // just crossed; easeStrikes seeds/glides it from next frame
     var confirmed = tickAtOrAfter(f, pos.strikeInstant);
-    if (confirmed != null) { S.provStrike[pos.betId] = confirmed; return { p: confirmed, status: "live" }; }
-    if (S.provStrike[pos.betId] == null) S.provStrike[pos.betId] = f.disp; // instant freeze at the lock moment
-    return { p: S.provStrike[pos.betId], status: "locking" };
+    var locked = confirmed != null && Math.abs(shown - confirmed) < confirmed * 1e-5;
+    return { p: shown, status: locked ? "locked" : "locking" };
+  }
+  // Once per frame: glide each locking position's shown strike toward its exact deterministic value.
+  function easeStrikes(now) {
+    assets.forEach(function (a) {
+      var pos = S.active[a], f = S.feeds[a];
+      if (!pos || pos.strike || now / 1000 < pos.strikeInstant) return;
+      var cur = S.provStrike[pos.betId];
+      if (cur == null) cur = f.samples.length ? f.samples[f.samples.length - 1].p : f.disp; // start at the on-screen price
+      var confirmed = tickAtOrAfter(f, pos.strikeInstant);
+      if (confirmed != null) cur = Math.abs(confirmed - cur) < confirmed * 3e-6 ? confirmed : cur + (confirmed - cur) * 0.16;
+      S.provStrike[pos.betId] = cur;
+    });
   }
   function viewOf(pos, f, now) {
     var nowS = now / 1000;
@@ -213,6 +230,7 @@
   function recordResult(a, pos) {
     S.seen[pos.betId] = true;
     delete S.provStrike[pos.betId];
+    delete S.finishT[pos.betId];
     var res = pos.result; // 1 win, 2 loss, 3 void
     var priceDir = res === PX.RESULT.VOID ? "tie" : (pos.up === (res === PX.RESULT.WIN) ? "up" : "down");
     var mine = res === PX.RESULT.WIN ? "win" : res === PX.RESULT.VOID ? "tie" : "lose";
@@ -515,12 +533,15 @@
     ctx.strokeStyle = PAL["ink-dim"]; ctx.globalAlpha = 0.4; ctx.setLineDash([3, 3]);
     ctx.beginPath(); ctx.moveTo(splitX, 0); ctx.lineTo(splitX, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
 
-    // strike / preview line: solid once locked, dashed while previewing or arming
-    var locked = v && (v.strikeStatus === "live" || v.strikeStatus === "locked" || v.strikeStatus === "locking");
+    // strike / preview line: solid ONLY once the strike has locked onto its exact value; dashed while
+    // previewing, arming, or still gliding to lock — so the line settles in smoothly, no snap.
+    var locked = v && v.strikeStatus === "locked";
+    var locking = v && (v.strikeStatus === "arming" || v.strikeStatus === "locking");
     ctx.strokeStyle = PAL.accent; ctx.lineWidth = locked ? 2 : 1.5;
     if (!locked) ctx.setLineDash([6, 4]);
     ctx.beginPath(); ctx.moveTo(0, strikeY); ctx.lineTo(W, strikeY); ctx.stroke(); ctx.setLineDash([]);
-    var tag = "@ " + fmt(splitPrice);
+    // hold the price out of the tag until it's exact — avoids showing a number that then jumps
+    var tag = locking ? "LOCKING…" : "@ " + fmt(splitPrice);
     ctx.font = "bold 11px 'Courier New',monospace";
     var tw = ctx.measureText(tag).width + 10;
     ctx.fillStyle = PAL.accent; ctx.fillRect(splitX - tw - 4, strikeY - 9, tw, 18);
@@ -580,25 +601,30 @@
     ctx.fillStyle = ready ? PAL.ok : PAL.bad;
     ctx.fillText(ready ? ">> TAP TO BET · " + S.dur + "s <<" : (v.phase === "arming" ? "STRIKE LOCKING IN" : "SWEAT IT"), zx, 12);
 
-    // finish line at the bet's close instant during a running bet
+    // finish line during a running bet. The settle price is the first tick at/after closeInstant, but
+    // Hermes lag means that tick lands on the chart ~1s to the RIGHT of the raw close instant. So the
+    // line glides to sit exactly on that settle tick once it exists — the dashed line and the ringed
+    // close tick coincide instead of drifting apart.
     if (v && (v.phase === "live" || v.phase === "settling")) {
-      var fx = Math.min(xOf(v.closeInstantMs), W - 1);
-      ctx.strokeStyle = PAL.ink; ctx.globalAlpha = 0.5; ctx.setLineDash([2, 3]);
-      ctx.beginPath(); ctx.moveTo(fx, 0); ctx.lineTo(fx, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
-      // ring the deterministic close tick (first tick at/after closeInstant) once it exists
+      var closeTick = null;
       if (now >= v.closeInstantMs) {
         var closeSec = v.closeInstantMs / 1000;
         for (var si = 0; si < f.samples.length; si++) {
-          var sp = f.samples[si];
-          if (sp.pt && sp.pt >= closeSec) {
-            var mx = xOf(sp.t), my = yOf(sp.p), strk = v.strike;
-            ctx.strokeStyle = strk != null && sp.p > strk ? PAL.ok : strk != null && sp.p < strk ? PAL.bad : PAL.ink;
-            ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(mx, my, 6, 0, 7); ctx.stroke();
-            ctx.font = "bold 9px 'Courier New',monospace"; ctx.textAlign = "center";
-            ctx.fillStyle = PAL["ink-dim"]; ctx.fillText("close", mx, my - 10);
-            break;
-          }
+          if (f.samples[si].pt && f.samples[si].pt >= closeSec) { closeTick = f.samples[si]; break; }
         }
+      }
+      var targetT = closeTick ? closeTick.t : v.closeInstantMs; // align to the settle tick's arrival
+      if (S.finishT[v.betId] == null) S.finishT[v.betId] = v.closeInstantMs;
+      S.finishT[v.betId] += (targetT - S.finishT[v.betId]) * 0.2; // glide, don't snap
+      var fx = Math.min(xOf(S.finishT[v.betId]), W - 1);
+      ctx.strokeStyle = PAL.ink; ctx.globalAlpha = 0.5; ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(fx, 0); ctx.lineTo(fx, H); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+      if (closeTick) {
+        var mx = xOf(closeTick.t), my = yOf(closeTick.p), strk = v.strike;
+        ctx.strokeStyle = strk != null && closeTick.p > strk ? PAL.ok : strk != null && closeTick.p < strk ? PAL.bad : PAL.ink;
+        ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(mx, my, 6, 0, 7); ctx.stroke();
+        ctx.font = "bold 9px 'Courier New',monospace"; ctx.textAlign = "center";
+        ctx.fillStyle = PAL["ink-dim"]; ctx.fillText("close", mx, my - 10);
       }
     }
   }
@@ -681,8 +707,12 @@
         el.phase.textContent = "STRIKE LOCKS IN"; el.phase.className = "phase hot"; el.clock.textContent = "0:0" + Math.min(9, sa);
       } else if (v.phase === "live") {
         var sc = Math.ceil(Math.max(0, v.closeInstantMs - now) / 1000);
-        var lead = v.strike != null ? (f.disp > v.strike ? "▲ AHEAD" : f.disp < v.strike ? "▼ BEHIND" : "EVEN") : "LIVE";
-        el.phase.textContent = lead + " @ " + fmt(v.strike); el.phase.className = "phase locked";
+        if (v.strikeStatus !== "locked") {
+          el.phase.textContent = "LOCKING…"; el.phase.className = "phase hot"; // strike still gliding to its exact value
+        } else {
+          var lead = f.disp > v.strike ? "▲ AHEAD" : f.disp < v.strike ? "▼ BEHIND" : "EVEN";
+          el.phase.textContent = lead + " @ " + fmt(v.strike); el.phase.className = "phase locked";
+        }
         el.clock.textContent = Math.floor(sc / 60) + ":" + ("0" + (sc % 60)).slice(-2);
       } else if (v.phase === "settling") {
         el.phase.textContent = "SETTLING…"; el.phase.className = "phase locked"; el.clock.textContent = "0:00";
@@ -699,6 +729,7 @@
   function frame() {
     var now = Date.now(), dt = now - lastFrame; lastFrame = now;
     syntheticTick(now, dt);
+    easeStrikes(now);
     draw(now);
     updateHud(now);
     requestAnimationFrame(frame);
