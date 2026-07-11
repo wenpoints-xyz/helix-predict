@@ -365,7 +365,7 @@
     if (!S.acct || S.acct === gasWarnedFor || !PX.NET.live) return;
     gasWarnedFor = S.acct;
     PX.nativeBalance(S.acct).then(function (w) {
-      if (w < 1000000000000000n) toast("Low on INJ gas — every tx needs a little INJ. Get it free at faucet.injective.network.");
+      if (w < 1000000000000000n) toast(HAS_FAUCET ? "Low on INJ gas — get it free at faucet.injective.network." : "Low on INJ gas — every tx needs a little INJ.");
     }).catch(function () {});
   }
   PX.wallet.onChange(function (w) {
@@ -388,7 +388,7 @@
     if (e && e.code === 4001) return "Cancelled.";
     var m = ((e && (e.message || (e.data && e.data.message) || (e.error && e.error.message))) || "").toLowerCase();
     if (m.indexOf("insufficient funds") !== -1 || m.indexOf("sender balance") !== -1 || m.indexOf("gas required") !== -1)
-      return "No gas — you need testnet INJ. Get it free at faucet.injective.network, then retry.";
+      return HAS_FAUCET ? "No gas — get testnet INJ free at faucet.injective.network, then retry." : "No gas — you need a little INJ for fees, then retry.";
     return fallback;
   }
 
@@ -401,7 +401,7 @@
     var chips = stakeValue();
     if (chips <= 0) { beep(160, 60, "sawtooth"); return; }
     if (S.cfg && chips < PX.toChips(S.cfg.minBet)) { toast("Min bet is " + Math.ceil(PX.toChips(S.cfg.minBet)) + " pts."); beep(160, 60, "sawtooth"); return; }
-    if (S.bal != null && S.bal < chips) { el.getpts.hidden = false; beep(160, 60, "sawtooth"); toast("Not enough points — hit the faucet."); return; }
+    if (S.bal != null && S.bal < chips) { el.getpts.hidden = false; beep(160, 60, "sawtooth"); toast(HAS_FAUCET ? "Not enough points — hit the faucet." : "Low $HELIXPOINT — tap GET $HELIXPOINT."); return; }
     var amt = PX.chipsToWei(chips), prov = PX.wallet.provider, from = S.acct, up = side === "up", dur = S.dur;
     beep(600, 30); if (navigator.vibrate) navigator.vibrate(12);
     S.pendingOpen[S.asset] = { t: Date.now(), minId: (S.myBets[0] ? S.myBets[0].betId : 0) + 1 };
@@ -429,11 +429,16 @@
       })();
     });
   }
+  // On testnet the button mints free MockPoints; on mainnet there's no faucet — it links out to
+  // buy real $HELIXPOINT instead.
+  var HAS_FAUCET = PX.NET.faucet !== false;
+  if (!HAS_FAUCET) el.getpts.textContent = "GET " + (PX.NET.stakeSymbol || "$HELIXPOINT");
   function updateBalance() {
     el.bal.textContent = S.bal == null ? "—" : Math.floor(S.bal).toLocaleString("en-US");
     el.getpts.hidden = !(S.acct && S.bal != null && S.bal < 10);
   }
   el.getpts.onclick = function () {
+    if (!HAS_FAUCET) { window.open(PX.NET.buyUrl || "https://pump.trippyinj.xyz/launch/8", "_blank", "noopener"); return; }
     if (!S.acct) { openWallet(); return; }
     toast("Minting test points — confirm in wallet.");
     PX.faucet(PX.wallet.provider, S.acct, PX.chipsToWei(1000))
@@ -492,7 +497,7 @@
     if (!S.acct) { openWallet(); return; }
     var chips = parseFloat(el.lpAmt.value); if (!(chips > 0)) { el.lpMsg.textContent = "Enter an amount."; return; }
     var amt = PX.chipsToWei(chips), from = S.acct;
-    if (S.bal != null && S.bal < chips) { el.lpMsg.textContent = "Not enough points — hit the faucet."; return; }
+    if (S.bal != null && S.bal < chips) { el.lpMsg.textContent = HAS_FAUCET ? "Not enough points — hit the faucet." : "Low $HELIXPOINT to deposit."; return; }
     el.lpMsg.textContent = "Depositing to the house…";
     ensureVaultAllowance(from, amt)
       .then(function () { return PX.vaultDeposit(PX.wallet.provider, from, amt); })
@@ -892,6 +897,10 @@
   resize();
   refreshConnectBtn();
   el.netbanner.style.display = "none";
+  if (!HAS_FAUCET) { // mainnet: real $HELIXPOINT, not play money
+    var rn = document.getElementById("realnote"); if (rn) rn.textContent = "mainnet · real $HELIXPOINT";
+    var tg = document.getElementById("tagline"); if (tg) tg.textContent = "Real $HELIXPOINT. Real prices (Pyth). Real stakes.";
+  }
   updateBalance();
   renderHist();
   connectFeed();

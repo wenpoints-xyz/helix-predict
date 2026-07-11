@@ -16,14 +16,23 @@
       explorer: "https://testnet.blockscout.injective.network",
       book: "0x6ea22353f4e6Be0A4D193CE7Bb3f63186BDf74e3",  // PredictionBook (per-user positions)
       vault: "0x745D463b01667Bf15915A27c23746d6D2Ad59f2B", // HouseVault (LP) — fresh, wired to the Book
-      points: "0x52045F671C452b7f91a7e436c64f126E78638F14", // MockPoints (faucet) — reused
-      live: true
+      points: "0x52045F671C452b7f91a7e436c64f126E78638F14", // MockPoints — has a faucet
+      live: true,
+      faucet: true,        // MockPoints can be minted for free (test money)
+      stakeSymbol: "points"
     },
     prod: {
       key: "prod", name: "Injective Mainnet", chainIdHex: "0x6f0", // 1776
       rpc: "https://sentry.evm-rpc.injective.network/",
       explorer: "https://blockscout.injective.network",
-      book: "", vault: "", points: "", live: false // not deployed yet — frontend gates as "coming soon"
+      // Audited PredictionBook stack, deployed 2026-07-11. Stake = real $HELIXPOINT (18-dec).
+      book: "0x98121Af94Ece69bFEC46544ff0Fc202F30010956",  // PredictionBook (mainnet)
+      vault: "0x67bf550106dD010Fd071cfd156070bF23352f7cB", // HouseVault (mainnet)
+      points: "0xAB3cc28e85056D5AB8f858F322a06AA6f9Eb64BD", // $HELIXPOINT ERC20 — the stake token
+      live: true,
+      faucet: false,       // NO faucet — HELIXPOINT is real; users buy it (see buyUrl)
+      buyUrl: "https://pump.trippyinj.xyz/launch/8",
+      stakeSymbol: "$HELIXPOINT"
     }
   };
   function pickNet() {
