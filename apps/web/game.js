@@ -748,7 +748,6 @@
         body.appendChild(kv("Status", "ON — taps fire with no popup", "var(--ok)"));
         body.appendChild(kv("Session key", short(a.address), null));
         body.appendChild(kv("Budget left", Math.floor(PX.toChips(a.budgetLeft)).toLocaleString("en-US") + " / " + Math.floor(PX.toChips(a.maxSpend)).toLocaleString("en-US") + " " + SYM, null));
-        body.appendChild(kv("Per-bet max", Math.floor(PX.toChips(a.maxStake)).toLocaleString("en-US") + " " + SYM, null));
         body.appendChild(kv("Expires in", fmtDur(left), left < 3600 ? "var(--bad)" : null));
         body.appendChild(kv("Gas", gasInj.toFixed(4) + " INJ", lowGas ? "var(--bad)" : null));
         var rowb = document.createElement("div"); rowb.style.cssText = "display:flex;gap:8px;margin-top:4px";
@@ -770,22 +769,17 @@
         // ---- SETUP form ----
         body.appendChild(txt("Approve a budget once, then tap UP/DOWN with no wallet popup. A browser key signs your bets and pays its own gas. It can spend at most the budget, expires in 24h, and you can revoke anytime."));
         var biggest = (PX.NET.chips && PX.NET.chips[PX.NET.chips.length - 1]) || 100;
-        var maxBetChips = S.cfg && S.cfg.maxBet ? PX.toChips(S.cfg.maxBet) : biggest;
-        var defStake = Math.floor(Math.min(maxBetChips, biggest));
         var defBudget = Math.floor(Math.min(S.bal != null ? S.bal : biggest * 10, biggest * 10));
         var rBudget = inputRow("Session budget", defBudget, SYM);
-        var rStake = inputRow("Per-bet max", defStake, SYM);
         var rGas = inputRow("Gas top-up", "0.05", "INJ");
-        body.appendChild(rBudget); body.appendChild(rStake); body.appendChild(rGas);
+        body.appendChild(rBudget); body.appendChild(rGas);
         body.appendChild(kv("Expires", "in 24h (revoke anytime)", null));
         var go = btn("ENABLE AUTO-BET", true); go.style.marginTop = "4px";
         go.onclick = function () {
-          var budget = parseFloat(rBudget.__input.value), stake = parseFloat(rStake.__input.value), inj = parseFloat(rGas.__input.value);
-          if (!(budget > 0) || !(stake > 0)) { status("Enter a budget and per-bet max."); return; }
-          if (stake > budget) { status("Per-bet max can't exceed the budget."); return; }
-          if (S.cfg && stake > PX.toChips(S.cfg.maxBet)) { status("Per-bet max is above the house maxBet."); return; }
+          var budget = parseFloat(rBudget.__input.value), inj = parseFloat(rGas.__input.value);
+          if (!(budget > 0)) { status("Enter a session budget."); return; }
           go.disabled = true;
-          doEnable(budget, stake, inj || 0.05, status).then(function () { setTimeout(function () { refreshAuto().then(render); }, 2500); })
+          doEnable(budget, inj || 0.05, status).then(function () { setTimeout(function () { refreshAuto().then(render); }, 2500); })
             .catch(function () { go.disabled = false; });
         };
         body.appendChild(go);
@@ -808,9 +802,15 @@
   function short(a) { return a ? a.slice(0, 6) + "…" + a.slice(-4) : "—"; }
   function injWei(inj) { return BigInt(Math.round(inj * 1e6)) * (10n ** 12n); } // INJ is 18-dec
   // The one-time enable: approve budget (if allowance short) -> grantSession -> fund the key's gas.
-  function doEnable(budgetChips, stakeChips, inj, status) {
+  // There is no user-facing per-bet cap: a single bet is bounded by the book's own maxBet + exposure
+  // caps, and the session by maxSpend. We still must satisfy the contract's grantSession invariants
+  // (maxStake <= maxBet AND maxSpend >= maxStake), so set maxStake = min(maxSpend, maxBet) — the
+  // largest non-binding value: it never rejects a bet the budget + book would otherwise allow.
+  function doEnable(budgetChips, inj, status) {
     var from = S.acct, prov = PX.wallet.provider;
-    var maxSpendWei = PX.chipsToWei(budgetChips), maxStakeWei = PX.chipsToWei(stakeChips);
+    var maxSpendWei = PX.chipsToWei(budgetChips);
+    var maxBetWei = S.cfg && S.cfg.maxBet ? S.cfg.maxBet : maxSpendWei;
+    var maxStakeWei = maxSpendWei < maxBetWei ? maxSpendWei : maxBetWei; // min(maxSpend, maxBet)
     var key = PXSession.ensureKey(PX.NET.key, from).address;
     var expiry = Math.floor(Date.now() / 1000) + 86340; // ~24h, just under MAX_SESSION to clear the bound
     status("Approve budget — confirm in wallet…");
