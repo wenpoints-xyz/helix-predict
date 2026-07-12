@@ -46,6 +46,7 @@
     background:linear-gradient(90deg, var(--stripe-b), var(--stripe-a)); }
   .tbar .ttl { flex:1; font-family:var(--comic); font-weight:bold; font-size:14px; letter-spacing:.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .tbtn { width:22px; height:20px; font-size:11px; line-height:1; font-family:var(--mono); font-weight:bold; cursor:pointer;
+    display:inline-flex; align-items:center; justify-content:center; padding:0; /* flex-center the glyph: emoji/symbol baseline metrics sit off-center in a plain button */
     background:var(--btn); color:var(--btn-ink); border:2px solid; border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt); }
   .tbtn:active { border-color:var(--bevel-dk) var(--bevel-lt) var(--bevel-lt) var(--bevel-dk); }
 
@@ -117,7 +118,7 @@
 <div class="machine" id="machine">
   <div class="tbar">
     <span class="ttl">PREDICT.EXE — up or down before the clock hits zero</span>
-    <button class="tbtn" id="statsbtn" title="my stats">🏆</button>
+    <button class="tbtn" id="statsbtn" title="leaderboard">&#x1F3C6;&#xFE0E;</button> <!-- VS15 = text-style (monochrome) trophy; falls back to color emoji where fonts lack the text glyph -->
     <button class="tbtn" id="histbtn" title="your bets">☰</button>
     <button class="tbtn" id="themebtn" title="theme">◐</button>
     <button class="tbtn" id="mutebtn" title="sound">♪</button>
@@ -188,7 +189,7 @@
   <span id="ver" data-time="__BUILD_TIME__" style="font-family:var(--mono);cursor:pointer;" title="tap for deploy time">build __BUILD_SHA__</span>
 </div>
 
-<script src="chain.js?v=2"></script>
-<script src="game.js?v=2"></script>
+<script src="chain.js?v=3"></script>
+<script src="game.js?v=3"></script>
 </body>
 </html>

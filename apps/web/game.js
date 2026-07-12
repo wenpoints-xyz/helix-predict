@@ -788,7 +788,7 @@
       // sort header (tap to cycle)
       h += "<div style='display:flex;font-size:10px;opacity:.6;padding:2px 0 4px;cursor:pointer' id='lbsorthd'>" +
         "<span style='width:26px'>#</span><span style='flex:1'>player</span>" +
-        "<span style='width:74px;text-align:right'>NET ⇅</span><span style='width:56px;text-align:right'>vol</span><span style='width:40px;text-align:right'>win%</span></div>";
+        "<span style='min-width:74px;text-align:right'>NET ⇅</span><span style='min-width:56px;margin-left:6px;text-align:right'>vol</span><span style='min-width:40px;margin-left:6px;text-align:right'>win%</span></div>";
       var rows = "";
       sorted.slice(0, 20).forEach(function (p, idx) {
         var m = metric(p); var neg = m < 0n; var mag = neg ? -m : m;
@@ -802,9 +802,9 @@
           "<div style='position:absolute;left:0;top:0;bottom:0;width:" + barPct + "%;background:" + barCol + ";opacity:.12'></div>" +
           "<span style='width:26px;position:relative'>" + medal + "</span>" +
           "<span style='flex:1;position:relative;" + (isMe ? "font-weight:bold" : "") + "'>" + shortAddr(p.addr) + badge + "</span>" +
-          "<span style='width:74px;text-align:right;position:relative;color:" + netCol + "'>" + fmtSigned(p.net) + "</span>" +
-          "<span style='width:56px;text-align:right;position:relative;opacity:.8'>" + fmtChips(p.vol) + "</span>" +
-          "<span style='width:40px;text-align:right;position:relative;opacity:.8'>" + (p.winRate == null ? "—" : p.winRate + "%") + "</span></div>";
+          "<span style='min-width:74px;text-align:right;position:relative;color:" + netCol + "'>" + fmtSigned(p.net) + "</span>" +
+          "<span style='min-width:56px;margin-left:6px;text-align:right;position:relative;opacity:.8'>" + fmtChips(p.vol) + "</span>" +
+          "<span style='min-width:40px;margin-left:6px;text-align:right;position:relative;opacity:.8'>" + (p.winRate == null ? "—" : p.winRate + "%") + "</span></div>";
       });
       // sticky YOU row
       var you = "";
