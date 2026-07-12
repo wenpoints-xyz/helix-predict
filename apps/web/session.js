@@ -126,14 +126,20 @@ if (typeof window !== "undefined") {
   var SEL_OPENBETFOR = "0x804f7759"; // openBetFor(address,uint256,bool,uint256,uint64)
   var SEL_SESSIONS = "0x431a1b97";   // sessions(address) -> (key,expiry,maxStake,maxSpend,spent)
   var SEL_APPROVE = "0x095ea7b3";    // approve(address,uint256) on the stake token
+  var SEL_CLAIM = "0x379607f5";      // claim(uint256 betId) — permissionless, always pays the bettor
 
   // Fixed ceiling for openBetFor (skips a per-bet estimateGas round-trip for responsiveness). Sized
   // for MAINNET: the $HELIXPOINT bank-precompile transferFrom is heavier than a plain ERC20, so
   // openBetFor measures ~439k gas there (testnet MockPoints is ~300k). You only pay gas USED, so
   // over-provisioning the LIMIT is free — keep comfortable headroom above the measured cost.
   var GAS_LIMIT = 1000000n;
+  // claim() hits the same bank-precompile transfer (~200-250k on mainnet) + storage writes. An on-chain
+  // OOG revert is SILENT (eth_sendRawTransaction returns a hash, so it looks like success) — so DON'T
+  // guess tight; over-provision. Confirmation is done by the caller reading owed(betId)->0, not the hash.
+  var CLAIM_GAS = 500000n;
   var SWEEP_GAS = 30000n;            // a bare INJ value transfer
   var GAS_TTL = 30000;               // ms to cache eth_gasPrice
+  var SEND_TIMEOUT = 20000;          // ms: abort a hung send so the per-key queue can't wedge the tap path
 
   function NET() { return window.PX && window.PX.NET; }
 
@@ -142,16 +148,21 @@ if (typeof window !== "undefined") {
   function _addr32(a) { return (a || "").replace(/^0x/, "").toLowerCase().padStart(64, "0"); }
   function _bool32(b) { return (b ? "1" : "0").padStart(64, "0"); }
 
-  // ---- raw json-rpc (read side reuses PX.NET.rpc) ----
+  // ---- raw json-rpc (read side reuses PX.NET.rpc). timeoutMs aborts a hung request (send path). ----
   var _rid = 0;
-  function rpc(method, params) {
-    return fetch(NET().rpc, {
+  function rpc(method, params, timeoutMs) {
+    var ctrl = (timeoutMs && typeof AbortController !== "undefined") ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, timeoutMs) : null;
+    var opts = {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: ++_rid, method: method, params: params || [] })
-    }).then(function (r) { return r.json(); }).then(function (j) {
+    };
+    if (ctrl) opts.signal = ctrl.signal;
+    return fetch(NET().rpc, opts).then(function (r) { return r.json(); }).then(function (j) {
+      if (timer) clearTimeout(timer);
       if (j.error) { var e = new Error(j.error.message || "rpc error"); e.rpc = j.error; throw e; }
       return j.result;
-    });
+    }, function (e) { if (timer) clearTimeout(timer); throw e; });
   }
 
   // ---- key storage (per network + per main account) ----
@@ -192,24 +203,52 @@ if (typeof window !== "undefined") {
     return m.indexOf("insufficient funds") !== -1 || m.indexOf("insufficient balance") !== -1;
   }
 
-  // Sign + broadcast a legacy tx from the session key. Bumps the local nonce on success; on a nonce
-  // error it resets and the caller may retry. Throws with .code='INSUFFICIENT_GAS' when the key is out
-  // of INJ (retryable on the wallet), else rethrows.
-  function sendRaw(net, account, to, data, valueWei, gasLimit) {
+  // ---- per-key send queue ----
+  // The session key now signs BOTH bets (openBetFor, on tap) and claims (on settle, async from poll).
+  // sendRaw reads the cached nonce at the start but only advances it after the send resolves, so two
+  // overlapping sends would grab the same nonce -> "nonce too low". Serialize per key so only ONE send
+  // is in flight at a time. Two guards keep this from wedging the tap path:
+  //   • BETS jump ahead of CLAIMS (hi lane) — a background claim never sits in front of a UP/DOWN tap.
+  //   • the queue advances on SETTLE (resolve OR reject) via then(res, rej), so a routine
+  //     INSUFFICIENT_GAS rejection can't wedge it; rpc() carries SEND_TIMEOUT so a hung send can't either.
+  var _q = {}; // addr -> { busy, hi:[bets], lo:[claims/sweeps] }
+  function _pump(addr) {
+    var q = _q[addr];
+    if (!q || q.busy) return;
+    var it = q.hi.shift() || q.lo.shift();
+    if (!it) return;
+    q.busy = true;
+    var next = function () { q.busy = false; _pump(addr); };
+    it.run().then(function (v) { next(); it.res(v); }, function (e) { next(); it.rej(e); });
+  }
+  function _enqueue(addr, hi, run) {
+    var q = _q[addr] || (_q[addr] = { busy: false, hi: [], lo: [] });
+    return new Promise(function (res, rej) {
+      (hi ? q.hi : q.lo).push({ run: run, res: res, rej: rej });
+      _pump(addr);
+    });
+  }
+
+  // Sign + broadcast a legacy tx from the session key, serialized per key. `hi` = tap-priority (bets).
+  // Bumps the local nonce on success; on any failure resets it (so the next send refetches). Throws
+  // with .code='INSUFFICIENT_GAS' when the key is out of INJ (retryable on the wallet), else rethrows.
+  function sendRaw(net, account, to, data, valueWei, gasLimit, hi) {
     var k = ensureKey(net, account);
-    var chainId = parseInt(NET().chainIdHex, 16);
-    return Promise.all([nextNonce(k.address), gasPrice()]).then(function (r) {
-      var tx = { nonce: r[0], gasPrice: r[1], gasLimit: gasLimit || GAS_LIMIT, to: to, value: valueWei || 0, data: data, chainId: chainId };
-      return signLegacyTx(tx, nobleSigner(k.priv)).then(function (raw) {
-        return rpc("eth_sendRawTransaction", [raw]).then(function (hash) {
-          _nonce[k.address] = r[0] + 1n; // advance locally so rapid taps don't collide
-          return hash;
+    return _enqueue(k.address, !!hi, function () {
+      var chainId = parseInt(NET().chainIdHex, 16);
+      return Promise.all([nextNonce(k.address), gasPrice()]).then(function (r) {
+        var tx = { nonce: r[0], gasPrice: r[1], gasLimit: gasLimit || GAS_LIMIT, to: to, value: valueWei || 0, data: data, chainId: chainId };
+        return signLegacyTx(tx, nobleSigner(k.priv)).then(function (raw) {
+          return rpc("eth_sendRawTransaction", [raw], SEND_TIMEOUT).then(function (hash) {
+            _nonce[k.address] = r[0] + 1n; // advance locally so rapid taps don't collide
+            return hash;
+          });
         });
+      }).catch(function (e) {
+        resetNonce(k.address); // any failure: drop the cached nonce so the next attempt refetches
+        if (isGasFundsError(e)) { e.code = "INSUFFICIENT_GAS"; }
+        throw e;
       });
-    }).catch(function (e) {
-      resetNonce(k.address); // any failure: drop the cached nonce so the next attempt refetches
-      if (isGasFundsError(e)) { e.code = "INSUFFICIENT_GAS"; }
-      throw e;
     });
   }
 
@@ -286,10 +325,18 @@ if (typeof window !== "undefined") {
   function revoke(provider, from) { return walletTx(provider, from, NET().book, SEL_REVOKE); }
   function topupGas(provider, from, toAddr, valueWei) { return walletTx(provider, from, toAddr, "0x", valueWei); }
 
-  // ---- the no-popup bet: openBetFor signed by the session key ----
+  // ---- the no-popup bet: openBetFor signed by the session key (tap-priority in the queue) ----
   function autoBet(net, account, marketId, up, stakeWei, dur) {
     var data = SEL_OPENBETFOR + _addr32(account) + _u256(marketId) + _bool32(up) + _u256(stakeWei) + _u256(dur);
-    return sendRaw(net, account, NET().book, data, 0, GAS_LIMIT);
+    return sendRaw(net, account, NET().book, data, 0, GAS_LIMIT, /*hi*/ true);
+  }
+
+  // ---- the no-popup claim: claim(betId) signed by the session key (low-priority behind bets) ----
+  // claim is permissionless and always pays positions[betId].bettor, so the key needs no grant, just
+  // gas. NOTE: a returned tx hash is NOT proof of a claim (an OOG revert still returns a hash) — the
+  // caller confirms via owed(betId)->0. CLAIM_GAS is over-provisioned so that path shouldn't trigger.
+  function claim(net, account, betId) {
+    return sendRaw(net, account, NET().book, SEL_CLAIM + _u256(betId), 0, CLAIM_GAS, /*hi*/ false);
   }
 
   // Sweep the session key's leftover INJ back to the main wallet (best-effort; called on disable/rotate).
@@ -299,7 +346,7 @@ if (typeof window !== "undefined") {
       var bal = r[0], gp = r[1], cost = gp * SWEEP_GAS;
       if (bal <= cost) return null; // nothing worth sweeping
       var send = bal - cost;
-      return sendRaw(net, account, account, "0x", send, SWEEP_GAS);
+      return sendRaw(net, account, account, "0x", send, SWEEP_GAS, /*hi*/ false);
     });
   }
 
@@ -309,7 +356,7 @@ if (typeof window !== "undefined") {
     ensureKey: ensureKey, loadKey: loadKey, saveKey: saveKey, dropKey: dropKey, skey: skey,
     status: status, sessionOf: sessionOf, sessionGasBalance: sessionGasBalance,
     approve: approve, grant: grant, revoke: revoke, topupGas: topupGas,
-    autoBet: autoBet, sweepGas: sweepGas, isGasFundsError: isGasFundsError,
-    GAS_LIMIT: GAS_LIMIT
+    autoBet: autoBet, claim: claim, sweepGas: sweepGas, isGasFundsError: isGasFundsError,
+    GAS_LIMIT: GAS_LIMIT, CLAIM_GAS: CLAIM_GAS
   };
 }

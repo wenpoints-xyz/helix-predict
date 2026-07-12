@@ -306,7 +306,7 @@ test("a matured-but-unsettled bet reads SETTLING… (chart freezes at the wall)"
 test("pending strip: unclaimed winnings show CLAIM and fire claim()", async ({ page }) => {
   const now = Math.floor(Date.now() / 1000);
   await setup(page, {
-    ids: [6], owed: 195n * E18,
+    ids: [6], owed: 195n * E18, sessionGas: 0n, // no funded session key -> manual user, claim via wallet
     pos: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, strikeInstant: now - 60, dur: 15, strike: 100, close: 200 } // WIN, owed 195
   });
   await page.goto("/");
@@ -361,7 +361,7 @@ test("bet history modal: lists results and claims an unclaimed win", async ({ pa
       6: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, payoutBps: 19500, strikeInstant: now - 90, dur: 15, strike: 100, close: 200 }, // WON
       7: { bettor: ACCT, marketId: 1, up: false, result: 2, stake: 25n * E18, payoutBps: 19500, strikeInstant: now - 200, dur: 30, strike: 200, close: 300 } // LOST
     },
-    owedById: { 6: 195n * E18, 7: 0n }
+    owedById: { 6: 195n * E18, 7: 0n }, sessionGas: 0n // no funded session key -> manual user, claim via wallet
   });
   await page.goto("/");
   await page.click("#connect");
@@ -458,4 +458,75 @@ test("auto-bet: a pre-broadcast gas shortfall falls back to a wallet openBet (ex
   await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.openBet);
   const txs = await sent(page);
   expect(txs.filter((t) => t.sel === SEL.openBet).length).toBe(1); // one bet, no double-fire
+});
+
+
+// ---- auto-claim (session key) ----
+// Decode the nonce out of a signed legacy tx (RLP list: [nonce, gasPrice, ...]). Small nonces only.
+function txNonce(raw) {
+  const h = raw.replace(/^0x/, "");
+  let b0 = parseInt(h.substr(0, 2), 16), i = 2;
+  if (b0 >= 0xf8) i += (b0 - 0xf7) * 2; // skip the list length-of-length bytes
+  const n0 = parseInt(h.substr(i, 2), 16);
+  if (n0 === 0x80) return 0;            // empty string -> 0
+  if (n0 < 0x80) return n0;             // single low byte is its own value
+  return parseInt(h.substr(i + 2, (n0 - 0x80) * 2), 16); // string of (n0-0x80) bytes
+}
+function rawSendCollector(page) {
+  const raws = [];
+  page.on("request", (req) => {
+    const pd = req.postData();
+    if (pd && pd.indexOf("eth_sendRawTransaction") !== -1) { try { raws.push(JSON.parse(pd).params[0]); } catch (e) {} }
+  });
+  return raws;
+}
+const CLAIM_SEL = "379607f5"; // claim(uint256) selector, embedded in the raw calldata
+
+test("auto-claim: a funded session key claims a win via raw tx (no wallet popup)", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  const raws = rawSendCollector(page);
+  await setup(page, {
+    sessionPriv: SESS_PRIV, sessionGas: 10n ** 18n, ids: [6], owed: 195n * E18, // funded key -> auto-claim
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, strikeInstant: now - 60, dur: 15, strike: 100, close: 200 }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect.poll(() => raws.some((r) => r.indexOf(CLAIM_SEL) !== -1)).toBeTruthy(); // claim went out as a raw tx
+  const txs = await sent(page);
+  expect(txs.find((t) => t.sel === SEL.claim)).toBeUndefined(); // never via the wallet
+});
+
+test("auto-claim: a manual user (no funded key) does NOT auto-claim; the win waits in the strip", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  const raws = rawSendCollector(page);
+  await setup(page, {
+    sessionGas: 0n, ids: [6], owed: 195n * E18, // no funded key -> manual, no auto-claim
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, strikeInstant: now - 60, dur: 15, strike: 100, close: 200 }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#pendingMsg")).toHaveText(/ready to claim/); // surfaced, not auto-claimed
+  await page.waitForTimeout(1500);
+  const txs = await sent(page);
+  expect(txs.find((t) => t.sel === SEL.claim)).toBeUndefined(); // no wallet auto-claim
+  expect(raws.some((r) => r.indexOf(CLAIM_SEL) !== -1)).toBeFalsy(); // no raw auto-claim either
+});
+
+test("auto-claim: bet + claim from one session key get DISTINCT nonces (serialize queue)", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  const future = now + 3600;
+  const raws = rawSendCollector(page);
+  await setup(page, {
+    sessionPriv: SESS_PRIV, sessionGas: 10n ** 18n, balance: 1000n * E18, allowance: (1n << 255n),
+    session: { key: SESS_ADDR, expiry: future, maxStake: 500n * E18, maxSpend: 1000n * E18, spent: 0n },
+    ids: [6], owed: 195n * E18, // a settled win -> auto-claim fires concurrently with the tap-bet
+    pos: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, strikeInstant: now - 60, dur: 15, strike: 100, close: 200 }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect.poll(() => page.evaluate(() => document.getElementById("autobtn").style.color)).not.toBe("");
+  await upZoneClick(page); // a bet, while the auto-claim is also firing
+  await expect.poll(() => raws.length).toBeGreaterThanOrEqual(2); // at least the bet + the claim went out
+  const nonces = raws.map(txNonce);
+  expect(new Set(nonces).size).toBe(nonces.length); // every raw send has a UNIQUE nonce (no collision)
 });

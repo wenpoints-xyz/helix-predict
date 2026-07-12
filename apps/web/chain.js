@@ -171,6 +171,10 @@
       });
     });
   }
+  // Raw page of a user's betIds (for the unbounded unclaimed sweep): positionsOf(user,start,count).
+  function positionsPage(addr, start, count) {
+    return ethCall(NET.book, SEL.positionsOf + addr32(addr) + u256(start) + u256(count)).then(decodePositionsOf);
+  }
   function marketsLength() { return ethCall(NET.book, SEL.marketsLength).then(function (h) { return Number(BigInt(h)); }); }
   function markets() { // -> [{marketId,feedId,enabled}]
     return marketsLength().then(function (n) {
@@ -323,7 +327,7 @@
   window.PX = {
     NET: NET, RESULT: RESULT,
     markets: markets, marketsLength: marketsLength, bookConfig: bookConfig,
-    myPositions: myPositions, getPosition: getPosition, positionsLength: positionsLength, owed: owed, reserveFor: reserveFor,
+    myPositions: myPositions, getPosition: getPosition, positionsLength: positionsLength, positionsPage: positionsPage, owed: owed, reserveFor: reserveFor,
     balanceOf: balanceOf, allowance: allowance, nativeBalance: nativeBalance,
     houseStats: houseStats, vaultShares: vaultShares, vaultMaxWithdraw: vaultMaxWithdraw,
     openBet: openBet, claim: claim, voidExpired: voidExpired, faucet: faucet, approve: approve,
