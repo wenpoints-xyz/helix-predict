@@ -1,0 +1,27 @@
+# ===== MAINNET leaderboard indexer (chainid 1776) =====
+# Indexes PredictionBook BetOpened/BetSettled -> SQLite -> leaderboard.json, published to the
+# helix-leaderboard CF Pages project. SEPARATE from the keeper: its own RPC budget + memory cap so a
+# backfill burst can never throttle the liveness-critical settler. EnvironmentFile=.env.mainnet.
+[Unit]
+Description=helix-predict leaderboard indexer — MAINNET (BetOpened/BetSettled -> leaderboard.json)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=helixkeeper
+Group=helixkeeper
+WorkingDirectory=/opt/helix-predict/apps/indexer
+EnvironmentFile=/opt/helix-predict/apps/indexer/.env.mainnet
+ExecStart=/usr/local/bin/node --experimental-sqlite src/indexer.js
+Restart=always
+RestartSec=10
+MemoryMax=256M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/helix-predict/apps/indexer
+
+[Install]
+WantedBy=multi-user.target

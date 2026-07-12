@@ -1,0 +1,5 @@
+# CORS so predict.wenpoints.xyz can fetch the board cross-origin; short TTL, and the frontend
+# appends ?t=<epoch> to bust the edge cache (query string is part of CF Pages' cache key).
+/leaderboard.json
+  Access-Control-Allow-Origin: *
+  Cache-Control: public, max-age=30, must-revalidate

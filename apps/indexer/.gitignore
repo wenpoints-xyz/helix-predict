@@ -1,0 +1,5 @@
+data/
+public/leaderboard.json
+node_modules/
+.env
+.env.mainnet

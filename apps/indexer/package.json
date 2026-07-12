@@ -1,0 +1,12 @@
+{
+  "name": "helix-indexer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Indexes PredictionBook BetOpened/BetSettled logs -> SQLite -> leaderboard JSON (global cross-user board, Phase 2).",
+  "scripts": {
+    "test": "node --experimental-sqlite --test",
+    "once": "node --experimental-sqlite src/indexer.js --once",
+    "start": "node --experimental-sqlite src/indexer.js"
+  }
+}
