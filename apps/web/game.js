@@ -728,10 +728,16 @@
       wrap2.appendChild(inp); var u = document.createElement("span"); u.textContent = sym; u.style.opacity = ".6"; wrap2.appendChild(u);
       row.appendChild(sp); row.appendChild(wrap2); row.__input = inp; return row;
     }
+    // NB: do NOT reuse the .tbtn class here — that's the 22x20px title-bar icon button, which squished
+    // these action buttons to a 22px sliver. Full inline styling with a Win95 press bevel instead.
     function btn(label, primary) {
       var b = document.createElement("button"); b.textContent = label;
-      b.className = primary ? "getpts" : "tbtn";
-      b.style.cssText = (primary ? "" : "border:2px outset var(--bevel-lt);background:var(--panel-2);color:var(--ink);") + "padding:7px 10px;font-family:var(--comic);font-weight:bold;cursor:pointer";
+      b.style.cssText = "padding:9px 12px;font-family:var(--comic);font-weight:bold;font-size:13px;cursor:pointer;white-space:nowrap;" +
+        "border:2px solid;border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt);" +
+        (primary ? "background:var(--accent);color:#fff;" : "background:var(--panel-2);color:var(--ink);");
+      b.addEventListener("pointerdown", function () { b.style.borderColor = "var(--bevel-dk) var(--bevel-lt) var(--bevel-lt) var(--bevel-dk)"; });
+      var up = function () { b.style.borderColor = "var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt)"; };
+      b.addEventListener("pointerup", up); b.addEventListener("pointerleave", up);
       return b;
     }
 
@@ -764,6 +770,7 @@
             .then(function () { status("Auto-bet off."); setTimeout(function () { refreshAuto().then(render); }, 2500); })
             .catch(function (e) { status(txErr(e, "Disable failed.")); });
         };
+        top.style.flex = "1"; off.style.flex = "1"; // share the row evenly instead of collapsing
         rowb.appendChild(top); rowb.appendChild(off); body.appendChild(rowb);
       } else {
         // ---- SETUP form ----
@@ -774,7 +781,7 @@
         var rGas = inputRow("Gas top-up", "0.05", "INJ");
         body.appendChild(rBudget); body.appendChild(rGas);
         body.appendChild(kv("Expires", "in 24h (revoke anytime)", null));
-        var go = btn("ENABLE AUTO-BET", true); go.style.marginTop = "4px";
+        var go = btn("ENABLE AUTO-BET", true); go.style.marginTop = "4px"; go.style.width = "100%";
         go.onclick = function () {
           var budget = parseFloat(rBudget.__input.value), inj = parseFloat(rGas.__input.value);
           if (!(budget > 0)) { status("Enter a session budget."); return; }
