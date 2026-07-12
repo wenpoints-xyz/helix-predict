@@ -127,7 +127,11 @@ if (typeof window !== "undefined") {
   var SEL_SESSIONS = "0x431a1b97";   // sessions(address) -> (key,expiry,maxStake,maxSpend,spent)
   var SEL_APPROVE = "0x095ea7b3";    // approve(address,uint256) on the stake token
 
-  var GAS_LIMIT = 400000n;           // fixed, generous ceiling for openBetFor (skips per-bet estimateGas)
+  // Fixed ceiling for openBetFor (skips a per-bet estimateGas round-trip for responsiveness). Sized
+  // for MAINNET: the $HELIXPOINT bank-precompile transferFrom is heavier than a plain ERC20, so
+  // openBetFor measures ~439k gas there (testnet MockPoints is ~300k). You only pay gas USED, so
+  // over-provisioning the LIMIT is free — keep comfortable headroom above the measured cost.
+  var GAS_LIMIT = 1000000n;
   var SWEEP_GAS = 30000n;            // a bare INJ value transfer
   var GAS_TTL = 30000;               // ms to cache eth_gasPrice
 
