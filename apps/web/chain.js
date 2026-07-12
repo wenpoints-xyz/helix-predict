@@ -14,8 +14,8 @@
       key: "test", name: "Injective Testnet", chainIdHex: "0x59f", // 1439
       rpc: "https://k8s.testnet.json-rpc.injective.network/",
       explorer: "https://testnet.blockscout.injective.network",
-      book: "0x6ea22353f4e6Be0A4D193CE7Bb3f63186BDf74e3",  // PredictionBook (per-user positions)
-      vault: "0x745D463b01667Bf15915A27c23746d6D2Ad59f2B", // HouseVault (LP) — fresh, wired to the Book
+      book: "0xBF93EF18F0000f2CFCbeE2535560833673696009",  // PredictionBook (per-user positions + session-key openBetFor)
+      vault: "0x1b0C8FF70237caF0a46C51FcBd8FBe57C69D93D7", // HouseVault (LP) — fresh, wired to the Book
       points: "0x52045F671C452b7f91a7e436c64f126E78638F14", // MockPoints — has a faucet
       live: true,
       faucet: true,        // MockPoints can be minted for free (test money)

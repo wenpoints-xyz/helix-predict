@@ -4,8 +4,8 @@ const { test, expect } = require("@playwright/test");
 // (markets/bookConfig/positionsOf/getPosition/houseStats/balanceOf/allowance/owed), the wallet
 // (window.ethereum), and the Pyth Hermes SSE, then drive the arcade. 127.0.0.1 => testnet config.
 
-const BOOK = "0x6ea22353f4e6be0a4d193ce7bb3f63186bdf74e3";  // PredictionBook
-const VAULT = "0x745d463b01667bf15915a27c23746d6d2ad59f2b"; // HouseVault (fresh)
+const BOOK = "0xbf93ef18f0000f2cfcbee2535560833673696009";  // PredictionBook (session-key openBetFor)
+const VAULT = "0x1b0c8ff70237caf0a46c51fcbd8fbe57c69d93d7"; // HouseVault (fresh, wired to the new Book)
 const POINTS = "0x52045f671c452b7f91a7e436c64f126e78638f14";
 const ACCT = "0xAbC0000000000000000000000000000000001234";
 const E18 = 10n ** 18n;
