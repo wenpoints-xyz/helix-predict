@@ -34,7 +34,8 @@
       faucet: false,       // NO faucet — HELIXPOINT is real; users buy it (see buyUrl)
       buyUrl: "https://pump.trippyinj.xyz/launch/8",
       stakeSymbol: "$HELIXPOINT",
-      chips: [1000, 5000, 10000, 100000] // stake presets ($HELIXPOINT scale): 1K/5K/10K/100K
+      chips: [1000, 5000, 10000, 100000], // stake presets ($HELIXPOINT scale): 1K/5K/10K/100K
+      lbUrl: "https://helix-leaderboard.pages.dev/leaderboard.json" // global board (indexer-published)
     }
   };
   function pickNet() {
@@ -328,6 +329,12 @@
     openBet: openBet, claim: claim, voidExpired: voidExpired, faucet: faucet, approve: approve,
     vaultDeposit: vaultDeposit, vaultWithdraw: vaultWithdraw,
     payout: payout, potentialWin: potentialWin, toChips: toChips, chipsToWei: chipsToWei,
+    // Global leaderboard JSON (indexer-published, CDN). Cache-busted so a fresh board shows within its
+    // short TTL. Resolves null when the network has no board (testnet — indexer is mainnet-only).
+    leaderboard: function () {
+      if (!NET.lbUrl) return Promise.resolve(null);
+      return fetch(NET.lbUrl + "?t=" + Math.floor(Date.now() / 30000)).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
+    },
     explorerAddr: function (a) { return NET.explorer + "/address/" + a; },
     explorerTx: function (t) { return NET.explorer + "/tx/" + t; },
     wallet: {

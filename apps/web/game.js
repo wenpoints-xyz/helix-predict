@@ -692,19 +692,46 @@
     return { net: net, vol: vol, w: w, l: l, v: v, biggest: biggest, streak: streak, total: w + l + v };
   }
   function signedChips(wei) { var s = wei < 0n ? "-" : "+"; var a = wei < 0n ? -wei : wei; return s + Math.floor(PX.toChips(a)).toLocaleString("en-US"); }
+  // ---- global leaderboard (Phase 2): fetched from the indexer JSON, sortable table + bars ----
+  var LB_WIN_KEY = ["day", "week", "month", "all"]; // maps STAT_WINS index -> JSON window key
+  var LB_SORTS = { net: ["🍀 LUCKIEST", -1], netUp: ["💀 MOST REKT", 1], vol: ["🎰 MOST ACTION", 0] };
+  function shortAddr(a) { return a.slice(0, 6) + "…" + a.slice(-4); }
+  function fmtSigned(weiStr) { var w = BigInt(weiStr); var s = w < 0n ? "-" : "+"; var a = w < 0n ? -w : w; return s + Math.floor(PX.toChips(a)).toLocaleString("en-US"); }
+  function fmtChips(weiStr) { return Math.floor(PX.toChips(BigInt(weiStr))).toLocaleString("en-US"); }
+  function sortPlayers(players, sort) {
+    var arr = players.slice();
+    if (sort === "vol") arr.sort(function (x, y) { var d = BigInt(y.vol) - BigInt(x.vol); return d > 0n ? 1 : d < 0n ? -1 : 0; });
+    else { var sgn = sort === "netUp" ? -1n : 1n; arr.sort(function (x, y) { var d = (BigInt(y.net) - BigInt(x.net)) * sgn; return d > 0n ? 1 : d < 0n ? -1 : 0; }); }
+    return arr;
+  }
+
   function showStats() {
+    if (S.lbMode == null) S.lbMode = (PX.NET.lbUrl ? "global" : "mine"); // board is the headline on mainnet
+    if (S.lbSort == null) S.lbSort = "net";
     var ov = document.createElement("div"); ov.id = "statsmodal";
     ov.style.cssText = "position:fixed;inset:0;background:rgba(6,11,22,.82);display:flex;align-items:center;justify-content:center;z-index:9998;padding:16px";
     var box = document.createElement("div");
-    box.style.cssText = "background:var(--panel);border:3px solid;border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt);min-width:300px;max-width:min(96vw,460px);display:flex;flex-direction:column";
+    box.style.cssText = "background:var(--panel);border:3px solid;border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt);min-width:300px;max-width:min(96vw,480px);max-height:90vh;display:flex;flex-direction:column";
     var hd = document.createElement("div");
     hd.style.cssText = "display:flex;align-items:center;gap:8px;padding:7px 10px;color:#fff;background:linear-gradient(90deg,var(--stripe-b),var(--stripe-a))";
-    hd.innerHTML = "<span style='flex:1;font-family:var(--comic);font-weight:bold'>🏆 MY STATS</span>";
+    hd.innerHTML = "<span id='lbtitle' style='flex:1;font-family:var(--comic);font-weight:bold'>🏆 LEADERBOARD</span>";
     var x = document.createElement("button"); x.className = "tbtn"; x.textContent = "×"; x.onclick = function () { document.body.removeChild(ov); };
     hd.appendChild(x); box.appendChild(hd);
+    // mode toggle (only when a global board exists on this network)
+    var modeRow = document.createElement("div"); modeRow.style.cssText = "display:flex;gap:4px;padding:6px 8px 0";
     var tabs = document.createElement("div"); tabs.style.cssText = "display:flex;gap:4px;padding:6px 8px";
-    var body = document.createElement("div"); body.style.cssText = "padding:10px 12px 14px;font-family:var(--mono);font-size:13px";
+    var body = document.createElement("div"); body.style.cssText = "padding:10px 12px 14px;font-family:var(--mono);font-size:13px;overflow:auto";
+    if (PX.NET.lbUrl) box.appendChild(modeRow);
     box.appendChild(tabs); box.appendChild(body);
+    function drawModes() {
+      modeRow.innerHTML = "";
+      [["global", "🌐 GLOBAL"], ["mine", "👤 MINE"]].forEach(function (m) {
+        var b = document.createElement("button"); b.className = "chip"; b.style.cssText = "flex:1;width:auto;padding:6px 0;font-size:12px";
+        b.textContent = m[1]; b.setAttribute("aria-pressed", S.lbMode === m[0] ? "true" : "false");
+        b.onclick = function () { S.lbMode = m[0]; drawModes(); render(); };
+        modeRow.appendChild(b);
+      });
+    }
     function drawTabs() {
       tabs.innerHTML = "";
       STAT_WINS.forEach(function (wn, i) {
@@ -719,9 +746,10 @@
         "<span style='opacity:.75'>" + a[0] + "</span><b style='color:" + (a[2] || "var(--ink)") + "'>" + a[1] + "</b>" +
         "<span style='opacity:.75;margin-left:14px'>" + b[0] + "</span><b style='color:" + (b[2] || "var(--ink)") + "'>" + b[1] + "</b></div>";
     }
-    function render() {
+    function renderMine() {
+      $("lbtitle").textContent = "🏆 MY STATS";
       if (!S.acct) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:14px'>Connect a wallet to see your stats.</div>"; return; }
-      if (S.statsBets == null) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:14px'>crunching your bets…</div>"; return; }
+      if (S.statsBets == null) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:14px'>crunching your bets…</div>"; if (S.acct) PX.myPositions(S.acct, 150).then(function (r) { S.statsBets = r.positions; if (S.lbMode === "mine") renderMine(); }).catch(function () { S.statsBets = []; if (S.lbMode === "mine") renderMine(); }); return; }
       if (!S.statsBets.length) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:16px'>No bets yet — tap UP or DOWN to play 🏆</div>"; return; }
       var s = computeStats(S.statsBets, STAT_WINS[S.statWin][1]);
       var col = s.net < 0n ? "var(--bad)" : s.net > 0n ? "var(--ok)" : "var(--ink)";
@@ -734,14 +762,79 @@
         "</div>" +
         statRow(["win rate", wr + "%"], ["record", s.w + "W " + s.l + "L " + s.v + "V"]) +
         statRow(["volume", Math.floor(PX.toChips(s.vol)).toLocaleString("en-US")], ["biggest hit", s.biggest > 0n ? "+" + Math.floor(PX.toChips(s.biggest)).toLocaleString("en-US") : "—", "var(--ok)"]) +
-        statRow(["streak", streakTxt], ["bets", String(s.total + (s.total !== S.statsBets.length ? "" : ""))]) +
+        statRow(["streak", streakTxt], ["bets", String(s.total)]) +
         (S.statsBets.length >= 150 ? "<div style='opacity:.5;font-size:10px;text-align:center;margin-top:8px'>last 150 bets</div>" : "");
     }
-    S.statsBets = null; drawTabs(); render();
-    if (S.acct) PX.myPositions(S.acct, 150).then(function (r) { S.statsBets = r.positions; render(); }).catch(function () { S.statsBets = []; render(); });
+    function renderGlobal() {
+      $("lbtitle").textContent = "🏆 " + LB_SORTS[S.lbSort][0];
+      if (S.lbData === undefined) { // loading
+        body.innerHTML = "<div style='opacity:.7;text-align:center;padding:16px'>crunching the chain… 🏆</div>";
+        PX.leaderboard().then(function (d) { S.lbData = d; if (S.lbMode === "global") renderGlobal(); });
+        return;
+      }
+      if (!S.lbData) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:16px'>couldn't load standings<br><button class='chip' id='lbretry' style='width:auto;margin-top:8px;padding:5px 12px'>RETRY</button></div>"; var rb = $("lbretry"); if (rb) rb.onclick = function () { S.lbData = undefined; renderGlobal(); }; return; }
+      var win = S.lbData.windows[LB_WIN_KEY[S.statWin]] || { global: {}, players: [] };
+      var g = win.global, players = win.players || [];
+      if (!players.length) { body.innerHTML = "<div style='opacity:.7;text-align:center;padding:18px'>No bets in this window yet — be the first 🏆<br><button class='chip' id='lbplay' style='width:auto;margin-top:10px;padding:6px 14px'>TAP TO PLAY</button></div>"; var pb = $("lbplay"); if (pb) pb.onclick = function () { document.body.removeChild(ov); }; return; }
+      var sorted = sortPlayers(players, S.lbSort);
+      var metric = function (p) { return S.lbSort === "vol" ? BigInt(p.vol) : BigInt(p.net); };
+      var maxAbs = 1n; sorted.forEach(function (p) { var m = metric(p); if (m < 0n) m = -m; if (m > maxAbs) maxAbs = m; });
+      var me = S.acct ? S.acct.toLowerCase() : null;
+      var myRank = -1; for (var i = 0; i < sorted.length; i++) if (sorted[i].addr === me) { myRank = i; break; }
+      var houseCol = BigInt(g.housePnl || "0") >= 0n ? "var(--ok)" : "var(--bad)";
+      var asset = { "0": "BTC", "1": "ETH", "2": "INJ" }[String(g.topAsset)] || "—";
+      var h = "<div style='font-size:11px;opacity:.75;text-align:center;margin-bottom:8px;line-height:1.5'>" +
+        "vol " + fmtChips(g.volume || "0") + " · " + (g.bets || 0) + " bets · house <b style='color:" + houseCol + "'>" + fmtSigned(g.housePnl || "0") + "</b> · " + asset + " 🔥</div>";
+      // sort header (tap to cycle)
+      h += "<div style='display:flex;font-size:10px;opacity:.6;padding:2px 0 4px;cursor:pointer' id='lbsorthd'>" +
+        "<span style='width:26px'>#</span><span style='flex:1'>player</span>" +
+        "<span style='width:74px;text-align:right'>NET ⇅</span><span style='width:56px;text-align:right'>vol</span><span style='width:40px;text-align:right'>win%</span></div>";
+      var rows = "";
+      sorted.slice(0, 20).forEach(function (p, idx) {
+        var m = metric(p); var neg = m < 0n; var mag = neg ? -m : m;
+        var barPct = Number(mag * 100n / maxAbs);
+        var barCol = S.lbSort === "vol" ? "var(--accent)" : (BigInt(p.net) < 0n ? "var(--bad)" : "var(--ok)");
+        var medal = idx === 0 ? "🥇" : idx === 1 ? "🥈" : idx === 2 ? "🥉" : (idx + 1);
+        var netCol = BigInt(p.net) < 0n ? "var(--bad)" : "var(--ok)";
+        var isMe = p.addr === me;
+        var badge = (p.streak >= 3 ? " 🔥" : "");
+        rows += "<div style='position:relative;display:flex;align-items:center;padding:5px 2px;border-top:1px solid var(--bevel-dk);" + (isMe ? "background:var(--panel-2);" : "") + "'>" +
+          "<div style='position:absolute;left:0;top:0;bottom:0;width:" + barPct + "%;background:" + barCol + ";opacity:.12'></div>" +
+          "<span style='width:26px;position:relative'>" + medal + "</span>" +
+          "<span style='flex:1;position:relative;" + (isMe ? "font-weight:bold" : "") + "'>" + shortAddr(p.addr) + badge + "</span>" +
+          "<span style='width:74px;text-align:right;position:relative;color:" + netCol + "'>" + fmtSigned(p.net) + "</span>" +
+          "<span style='width:56px;text-align:right;position:relative;opacity:.8'>" + fmtChips(p.vol) + "</span>" +
+          "<span style='width:40px;text-align:right;position:relative;opacity:.8'>" + (p.winRate == null ? "—" : p.winRate + "%") + "</span></div>";
+      });
+      // sticky YOU row
+      var you = "";
+      if (me) {
+        if (myRank >= 0) {
+          var mp = sorted[myRank];
+          you = "<div style='display:flex;align-items:center;gap:8px;margin-top:8px;padding:7px 6px;border:2px solid var(--accent);background:var(--panel-2)'>" +
+            "<span style='font-weight:bold'>👉 YOU #" + (myRank + 1) + "</span>" +
+            "<span style='flex:1;text-align:right;color:" + (BigInt(mp.net) < 0n ? "var(--bad)" : "var(--ok)") + ";font-weight:bold'>" + fmtSigned(mp.net) + "</span>" +
+            "<span style='opacity:.7'>vol " + fmtChips(mp.vol) + "</span>" +
+            "<button class='chip' id='lbshare' style='width:auto;padding:4px 10px'>SHARE</button></div>";
+        } else {
+          you = "<div style='margin-top:8px;padding:7px 6px;border:2px solid var(--bevel-dk);opacity:.7;text-align:center'>You're not on this board yet — play a bet 🏆</div>";
+        }
+      }
+      body.innerHTML = h + rows + you;
+      var sh = $("lbsorthd"); if (sh) sh.onclick = function () { S.lbSort = S.lbSort === "net" ? "netUp" : S.lbSort === "netUp" ? "vol" : "net"; renderGlobal(); };
+      var shb = $("lbshare"); if (shb) shb.onclick = function () {
+        var txt = "I'm #" + (myRank + 1) + " on wenpoints predict 🏆 " + (window.location.origin || "https://predict.wenpoints.xyz");
+        if (navigator.clipboard) navigator.clipboard.writeText(txt).then(function () { toast("Rank copied — go flex."); }, function () { toast(txt); });
+        else toast(txt);
+      };
+    }
+    function render() { if (S.lbMode === "global" && PX.NET.lbUrl) renderGlobal(); else renderMine(); }
+    S.statsBets = null; if (S.lbData === null) S.lbData = undefined; // allow re-fetch on reopen
     ov.appendChild(box);
     ov.onclick = function (e) { if (e.target === ov) document.body.removeChild(ov); };
-    document.body.appendChild(ov);
+    document.body.appendChild(ov); // must be in the document BEFORE render() (it uses getElementById)
+    if (PX.NET.lbUrl) drawModes();
+    drawTabs(); render();
   }
   el.statsbtn.onclick = showStats;
 
