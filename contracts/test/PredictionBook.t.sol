@@ -554,4 +554,169 @@ contract PredictionBookTest is Test {
         book.voidExpired(betId);
         assertEq(uint8(book.getPosition(betId).result), uint8(PredictionBook.Result.Void));
     }
+
+    // ================= session-key auto-bet (grantSession / revokeSession / openBetFor) =================
+    //
+    //   grantSession(key,maxStake,expiry,maxSpend) ─► sessions[bettor]
+    //   openBetFor(bettor,...) by the KEY ─► _open(bettor) : escrow from BETTOR, position under BETTOR
+    //     walls: msg.sender==key · now<expiry · stake<=maxStake · spent+stake<=maxSpend (odometer)
+    //   revokeSession() ─► delete (works even while paused)
+
+    address sessionKey = address(0x5E5510);
+
+    function _grant(address bettor, address key, uint128 maxStake, uint64 ttl, uint128 maxSpend) internal {
+        vm.prank(bettor);
+        book.grantSession(key, maxStake, uint64(block.timestamp) + ttl, maxSpend);
+    }
+
+    function test_GrantSession_storesAndEmits() public {
+        uint64 exp = uint64(block.timestamp) + 3600;
+        vm.expectEmit(true, true, false, true, address(book));
+        emit PredictionBook.SessionGranted(alice, sessionKey, 100 ether, exp, 1000 ether);
+        vm.prank(alice);
+        book.grantSession(sessionKey, 100 ether, exp, 1000 ether);
+        (address key, uint64 expiry, uint128 maxStake, uint128 maxSpend, uint128 spent) = book.sessions(alice);
+        assertEq(key, sessionKey);
+        assertEq(expiry, exp);
+        assertEq(maxStake, 100 ether);
+        assertEq(maxSpend, 1000 ether);
+        assertEq(spent, 0);
+    }
+
+    function test_GrantSession_rejects() public {
+        uint64 exp = uint64(block.timestamp) + 3600;
+        uint64 pastCap = uint64(block.timestamp) + book.MAX_SESSION() + 1; // hoist the view call out of expectRevert
+        uint64 nowTs = uint64(block.timestamp);
+        vm.startPrank(alice);
+        vm.expectRevert(PredictionBook.BadSession.selector);
+        book.grantSession(address(0), 100 ether, exp, 1000 ether); // zero key
+        vm.expectRevert(PredictionBook.BadSession.selector);
+        book.grantSession(sessionKey, 100 ether, nowTs, 1000 ether); // expiry <= now
+        vm.expectRevert(PredictionBook.BadSession.selector);
+        book.grantSession(sessionKey, 100 ether, pastCap, 1000 ether); // > MAX_SESSION cap
+        vm.expectRevert(PredictionBook.BadSession.selector);
+        book.grantSession(sessionKey, 0, exp, 1000 ether); // maxStake 0
+        vm.expectRevert(PredictionBook.BadSession.selector);
+        book.grantSession(sessionKey, uint128(MAXBET) + 1, exp, uint128(MAXBET) + 1); // maxStake > maxBet
+        vm.expectRevert(PredictionBook.BadSession.selector);
+        book.grantSession(sessionKey, 100 ether, exp, 99 ether); // maxSpend < maxStake
+        vm.stopPrank();
+    }
+
+    function test_OpenBetFor_happy_escrowsFromBettor_positionUnderBettor() public {
+        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        uint256 stake = 50 ether;
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256 keyBefore = token.balanceOf(sessionKey); // 0 — the key holds no POINTS
+        vm.prank(sessionKey);
+        uint256 betId = book.openBetFor(alice, marketId, true, stake, 30);
+        assertEq(token.balanceOf(address(book)), stake, "escrow held");
+        assertEq(aliceBefore - token.balanceOf(alice), stake, "stake pulled from the BETTOR");
+        assertEq(token.balanceOf(sessionKey), keyBefore, "session key funds untouched");
+        PredictionBook.Position memory p = book.getPosition(betId);
+        assertEq(p.bettor, alice, "position recorded under the bettor");
+        assertEq(book.openCount(alice), 1);
+        assertEq(book.openCount(sessionKey), 0, "session key is not the bettor");
+        (,,,, uint128 spent) = book.sessions(alice);
+        assertEq(spent, stake, "spend odometer advanced by stake");
+    }
+
+    function test_OpenBetFor_authReverts() public {
+        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        vm.prank(bob); // not the key
+        vm.expectRevert(PredictionBook.NotSessionKey.selector);
+        book.openBetFor(alice, marketId, true, 10 ether, 30);
+        vm.prank(sessionKey); // bob has no session (zero key)
+        vm.expectRevert(PredictionBook.NotSessionKey.selector);
+        book.openBetFor(bob, marketId, true, 10 ether, 30);
+        vm.prank(sessionKey); // over per-bet maxStake
+        vm.expectRevert(PredictionBook.SessionStakeExceeded.selector);
+        book.openBetFor(alice, marketId, true, 100 ether + 1, 30);
+    }
+
+    function test_OpenBetFor_expiredReverts() public {
+        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        vm.warp(block.timestamp + 3601);
+        vm.prank(sessionKey);
+        vm.expectRevert(PredictionBook.SessionExpired.selector);
+        book.openBetFor(alice, marketId, true, 10 ether, 30);
+    }
+
+    function test_OpenBetFor_budgetCap_decoupledFromAllowance() public {
+        // alice's ERC20 allowance to the book is unlimited (setUp), yet the session key is capped at
+        // maxSpend=120: two 50s ok (spent 100), a third 50 would hit 150 > 120 -> revert.
+        _grant(alice, sessionKey, 100 ether, 3600, 120 ether);
+        vm.startPrank(sessionKey);
+        book.openBetFor(alice, marketId, true, 50 ether, 30);
+        book.openBetFor(alice, marketId, true, 50 ether, 30);
+        vm.expectRevert(PredictionBook.SessionBudgetExceeded.selector);
+        book.openBetFor(alice, marketId, true, 50 ether, 30);
+        vm.stopPrank();
+        (,,,, uint128 spent) = book.sessions(alice);
+        assertEq(spent, 100 ether, "odometer unchanged by the reverted bet");
+    }
+
+    function test_RevokeSession_killsKey() public {
+        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        vm.expectEmit(true, true, false, false, address(book));
+        emit PredictionBook.SessionRevoked(alice, sessionKey);
+        vm.prank(alice);
+        book.revokeSession();
+        vm.prank(sessionKey);
+        vm.expectRevert(PredictionBook.NotSessionKey.selector);
+        book.openBetFor(alice, marketId, true, 10 ether, 30);
+    }
+
+    function test_RevokeSession_worksWhilePaused() public {
+        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        book.pause();
+        vm.prank(alice);
+        book.revokeSession(); // must NOT be whenNotPaused-gated — a user can always kill a key
+        (address key,,,,) = book.sessions(alice);
+        assertEq(key, address(0), "session cleared during a pause");
+    }
+
+    function test_ReGrant_resetsSpent() public {
+        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        vm.prank(sessionKey);
+        book.openBetFor(alice, marketId, true, 50 ether, 30);
+        (,,,, uint128 spent1) = book.sessions(alice);
+        assertEq(spent1, 50 ether);
+        _grant(alice, address(0xBEEF), 100 ether, 3600, 1000 ether); // rotate
+        (address key,,,, uint128 spent2) = book.sessions(alice);
+        assertEq(key, address(0xBEEF));
+        assertEq(spent2, 0, "odometer reset on re-grant");
+    }
+
+    function test_OpenBetFor_capsStillEnforced() public {
+        book.setParams(M, 100, 5000, MINBET, MAXBET); // per-bet cap 1% of 1M = 10k
+        _grant(alice, sessionKey, uint128(MAXBET), 3600, uint128(MAXBET)); // session allows big; caps must still bite
+        vm.prank(sessionKey);
+        vm.expectRevert(PredictionBook.BetCapExceeded.selector);
+        book.openBetFor(alice, marketId, true, 20_000 ether, 30); // reserve 19000 > 10000
+    }
+
+    function test_OpenBetFor_whenPausedReverts() public {
+        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        book.pause();
+        vm.prank(sessionKey);
+        vm.expectRevert(); // Pausable: EnforcedPause
+        book.openBetFor(alice, marketId, true, 10 ether, 30);
+    }
+
+    function test_OpenBetFor_settleAndClaim_paysBettorNotKey() public {
+        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        uint256 stake = 100 ether;
+        vm.prank(sessionKey);
+        uint256 betId = book.openBetFor(alice, marketId, true, stake, 30);
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256 keyBefore = token.balanceOf(sessionKey);
+        _settle(betId, 100_000, 100_001, 0, 0); // up, close > strike -> win
+        book.claim(betId);
+        uint256 tip = (stake * 100) / 10000;
+        uint256 distributable = (stake * M) / 10000;
+        assertEq(token.balanceOf(alice) - aliceBefore, distributable - tip, "winnings pay the BETTOR");
+        assertEq(token.balanceOf(sessionKey), keyBefore, "session key receives nothing");
+        assertEq(book.openCount(alice), 0);
+    }
 }
