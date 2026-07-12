@@ -534,7 +534,26 @@
     el.autobtn.style.color = on ? "var(--ok)" : "";
     el.autobtn.style.filter = on ? "drop-shadow(0 0 3px var(--ok))" : "";
     el.autobtn.title = on ? "auto-bet ON — no popup per tap" : "auto-bet (no popup per tap)";
+    updateAutoBanner(on);
   }
+  // Promo strip above the asset tabs: connected + no active grant + not dismissed -> pitch auto-sign.
+  // Tap opens the ⚡ modal; × dismisses forever. Hides itself the moment a grant is live.
+  var BANNER_KEY = "px-autobanner-dismissed";
+  function updateAutoBanner(on) {
+    var b = $("autobanner"); if (!b) return;
+    var dismissed = false; try { dismissed = !!localStorage.getItem(BANNER_KEY); } catch (e) {}
+    var show = !!(S.acct && window.PXSession && !on && !dismissed);
+    b.style.display = show ? "flex" : "none";
+  }
+  var _bn = $("autobanner"), _bnx = $("autobannerx");
+  if (_bn) _bn.onclick = function (e) {
+    if (e.target === _bnx) return;
+    showAuto();
+  };
+  if (_bnx) _bnx.onclick = function () {
+    try { localStorage.setItem(BANNER_KEY, "1"); } catch (e) {}
+    _bn.style.display = "none";
+  };
   function refreshAuto() {
     if (!window.PXSession || !S.acct) { S.auto = null; updateAutoBtn(); return Promise.resolve(); }
     return PXSession.status(PX.NET.key, S.acct).then(function (st) { S.auto = st; updateAutoBtn(); })

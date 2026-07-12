@@ -125,6 +125,15 @@
     <button class="tbtn" id="autobtn" title="auto-bet (no popup per tap)">⚡</button>
   </div>
 
+  <!-- auto-sign promo: shows only when connected with NO active session grant; × dismisses forever -->
+  <div id="autobanner" style="display:none;align-items:center;gap:8px;margin:6px 6px 0;padding:6px 10px;cursor:pointer;
+       font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--panel-2);
+       border:2px solid;border-color:var(--bevel-dk) var(--bevel-lt) var(--bevel-lt) var(--bevel-dk)">
+    <span>⚡</span>
+    <span style="flex:1"><b>AUTO-SIGN</b> — bet with no wallet popups · <b style="color:var(--accent-2)">ENABLE</b></span>
+    <button class="tbtn" id="autobannerx" title="dismiss">×</button>
+  </div>
+
   <div class="menub" id="tabs">
     <button class="tab" data-asset="BTC" aria-pressed="true">BTC</button>
     <button class="tab" data-asset="ETH" aria-pressed="false">ETH</button>
@@ -191,9 +200,9 @@
 </div>
 
 <!-- session-key auto-bet: vendored keccak (global) + the ESM signer/session layer (sets window.PXSession) -->
-<script src="vendor/js-sha3.js?v=5"></script>
-<script type="module" src="session.js?v=5"></script>
-<script src="chain.js?v=5"></script>
-<script src="game.js?v=5"></script>
+<script src="vendor/js-sha3.js?v=6"></script>
+<script type="module" src="session.js?v=6"></script>
+<script src="chain.js?v=6"></script>
+<script src="game.js?v=6"></script>
 </body>
 </html>
