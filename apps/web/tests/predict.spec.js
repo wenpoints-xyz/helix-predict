@@ -24,8 +24,18 @@ const SEL = {
   maxBetExposureBps: "0x6faa2d3a", maxAggExposureBps: "0xd2b4eda2",
   balanceOf: "0x70a08231", allowance: "0xdd62ed3e",
   openBet: "0x058a345d", claim: "0x379607f5", faucet: "0x57915897", approve: "0x095ea7b3",
-  houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77"
+  houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77",
+  openBetFor: "0x804f7759", grantSession: "0x076fa699", revokeSession: "0xc4605d8c", sessions: "0x431a1b97"
 };
+// A known session key used by the auto-bet tests: priv -> derived EOA address (matches session.js).
+const SESS_PRIV = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+const SESS_ADDR = "0x639d6caadb5617d324c1ad0becb16262fc58ce5f";
+// sessions(bettor) -> (address key, uint64 expiry, uint128 maxStake, uint128 maxSpend, uint128 spent)
+function sessionsResult(s) {
+  s = s || {};
+  const key = (s.key || "0x0000000000000000000000000000000000000000").toLowerCase().replace(/^0x/, "").padStart(64, "0");
+  return "0x" + key + u(s.expiry || 0) + u(s.maxStake || 0n) + u(s.maxSpend || 0n) + u(s.spent || 0n);
+}
 
 const u = (v) => BigInt(v).toString(16).padStart(64, "0");
 const lastWord = (data) => BigInt("0x" + data.slice(-64)); // decode a single uint arg
@@ -84,12 +94,23 @@ async function setup(page, opts) {
         const v = opts.allowance === "flip" ? (allowCalls++ === 0 ? 0n : (1n << 255n)) : opts.allowance;
         result = "0x" + u(v);
       }
+      else if (sel === SEL.sessions) result = sessionsResult(opts.session);
     } else if (req.method === "eth_blockNumber") result = "0x1";
-    else if (req.method === "eth_getBalance") result = "0x" + (10n ** 18n).toString(16); // 1 INJ gas
+    else if (req.method === "eth_getBalance") result = "0x" + (opts.sessionGas != null ? opts.sessionGas : 10n ** 18n).toString(16); // INJ gas (1 INJ default)
+    else if (req.method === "eth_gasPrice") result = "0x" + (1000000000n).toString(16); // 1 gwei
+    else if (req.method === "eth_getTransactionCount") result = "0x0";
+    else if (req.method === "eth_sendRawTransaction") {
+      if (opts.rawFail) {
+        await route.fulfill({ contentType: "application/json", body: JSON.stringify({ jsonrpc: "2.0", id: req.id, error: { code: -32000, message: "insufficient funds for gas * price + value" } }) });
+        return;
+      }
+      result = "0x" + "ab".repeat(32);
+    }
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ jsonrpc: "2.0", id: req.id, result }) });
   });
-  await page.addInitScript(({ ACCT, FEEDS, PT, REVERT }) => {
+  await page.addInitScript(({ ACCT, FEEDS, PT, REVERT, SESS }) => {
     const cbs = {}; window.__sent = [];
+    if (SESS) { try { localStorage.setItem(SESS.skey, SESS.priv); } catch (e) {} } // seed a known session key
     window.ethereum = {
       isMetaMask: true,
       request: async ({ method, params }) => {
@@ -115,7 +136,8 @@ async function setup(page, opts) {
       }
       close() {}
     };
-  }, { ACCT, FEEDS, PT: opts.pt != null ? opts.pt : null, REVERT: opts.txRevert || null });
+  }, { ACCT, FEEDS, PT: opts.pt != null ? opts.pt : null, REVERT: opts.txRevert || null,
+       SESS: opts.sessionPriv ? { skey: "px-session:test:" + ACCT.toLowerCase(), priv: opts.sessionPriv } : null });
 }
 const sent = (page) => page.evaluate(() => window.__sent.map((t) => ({ to: (t.to || "").toLowerCase(), sel: (t.data || "").slice(0, 10) })));
 async function upZoneClick(page) {
@@ -391,4 +413,49 @@ test("wallet connection survives a reload (silent reconnect)", async ({ page }) 
   await expect(page.locator("#connect")).toContainText("0xAbC0");
   await page.reload();
   await expect(page.locator("#connect")).toContainText("0xAbC0");
+});
+
+// ---- session-key auto-bet ----
+test("auto-bet: a live session grant lights the ⚡ button (granted status)", async ({ page }) => {
+  const future = Math.floor(Date.now() / 1000) + 3600;
+  await setup(page, {
+    balance: 1000n * E18, allowance: (1n << 255n), sessionPriv: SESS_PRIV,
+    session: { key: SESS_ADDR, expiry: future, maxStake: 500n * E18, maxSpend: 1000n * E18, spent: 0n }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  // refreshAuto derives the key from localStorage, reads sessions(), and lights the button green
+  await expect.poll(() => page.evaluate(() => document.getElementById("autobtn").style.color)).not.toBe("");
+});
+
+test("auto-bet: with a grant, tapping fires openBetFor as a raw tx (NO wallet popup)", async ({ page }) => {
+  const future = Math.floor(Date.now() / 1000) + 3600;
+  await setup(page, {
+    balance: 1000n * E18, allowance: (1n << 255n), sessionPriv: SESS_PRIV,
+    session: { key: SESS_ADDR, expiry: future, maxStake: 500n * E18, maxSpend: 1000n * E18, spent: 0n }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect.poll(() => page.evaluate(() => document.getElementById("autobtn").style.color)).not.toBe("");
+  const rawReq = page.waitForRequest((r) => r.url().includes("k8s.testnet") && (r.postData() || "").includes("eth_sendRawTransaction"));
+  await upZoneClick(page);
+  await rawReq; // the bet went out as a locally-signed raw tx
+  const txs = await sent(page);
+  expect(txs.find((t) => t.sel === SEL.openBet)).toBeUndefined(); // never touched the wallet
+});
+
+test("auto-bet: a pre-broadcast gas shortfall falls back to a wallet openBet (exactly one bet)", async ({ page }) => {
+  const future = Math.floor(Date.now() / 1000) + 3600;
+  await setup(page, {
+    balance: 1000n * E18, allowance: (1n << 255n), sessionPriv: SESS_PRIV, sessionGas: 0n, rawFail: true,
+    session: { key: SESS_ADDR, expiry: future, maxStake: 500n * E18, maxSpend: 1000n * E18, spent: 0n }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect.poll(() => page.evaluate(() => document.getElementById("autobtn").style.color)).not.toBe("");
+  await upZoneClick(page);
+  // raw send errors with "insufficient funds" -> catch-and-retry lands one wallet openBet
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.openBet);
+  const txs = await sent(page);
+  expect(txs.filter((t) => t.sel === SEL.openBet).length).toBe(1); // one bet, no double-fire
 });

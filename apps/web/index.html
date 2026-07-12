@@ -122,6 +122,7 @@
     <button class="tbtn" id="histbtn" title="your bets">☰</button>
     <button class="tbtn" id="themebtn" title="theme">◐</button>
     <button class="tbtn" id="mutebtn" title="sound">♪</button>
+    <button class="tbtn" id="autobtn" title="auto-bet (no popup per tap)">⚡</button>
   </div>
 
   <div class="menub" id="tabs">
@@ -189,6 +190,9 @@
   <span id="ver" data-time="__BUILD_TIME__" style="font-family:var(--mono);cursor:pointer;" title="tap for deploy time">build __BUILD_SHA__</span>
 </div>
 
+<!-- session-key auto-bet: vendored keccak (global) + the ESM signer/session layer (sets window.PXSession) -->
+<script src="vendor/js-sha3.js?v=3"></script>
+<script type="module" src="session.js?v=3"></script>
 <script src="chain.js?v=3"></script>
 <script src="game.js?v=3"></script>
 </body>

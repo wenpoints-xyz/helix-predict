@@ -26,7 +26,7 @@
     dur: parseInt(localStorage.predict_dur || "15", 10) || 15,
     bal: null, acct: null, cfg: null, markets: {},
     feeds: {}, active: {}, myBets: [], seen: {}, claiming: {}, pendingOpen: {}, provStrike: {}, finishT: {}, hist: {},
-    pending: null, owedZero: {}, statsBets: null, statWin: 3, house: null,
+    pending: null, owedZero: {}, statsBets: null, statWin: 3, house: null, auto: null,
     muted: localStorage.predict_mute === "1",
     hover: null, press: null, flash: null,
     feedMode: "live", lastAnyTick: Date.now()
@@ -39,7 +39,7 @@
   var wrap = $("chartwrap");
   var el = { rid: $("rid"), phase: $("phase"), clock: $("clock"), bal: $("bal"), hist: $("hist"),
              led: $("led"), px: $("px"), feedlbl: $("feedlbl"), getpts: $("getpts"),
-             connect: $("connect"), netbanner: $("netbanner"), dur: $("durbtn"), histbtn: $("histbtn"), statsbtn: $("statsbtn"),
+             connect: $("connect"), netbanner: $("netbanner"), dur: $("durbtn"), histbtn: $("histbtn"), statsbtn: $("statsbtn"), autobtn: $("autobtn"),
              pending: $("pending"), pendingMsg: $("pendingMsg"), pendingBtn: $("pendingBtn"),
              lp: $("lp"), lpToggle: $("lpToggle"), lpBank: $("lpBank"), lpMine: $("lpMine"),
              lpUtil: $("lpUtil"), lpAmt: $("lpAmt"), lpDep: $("lpDep"), lpWd: $("lpWd"), lpMsg: $("lpMsg") };
@@ -227,6 +227,7 @@
     }).catch(function () {}).then(function () {
       if (S.acct) refreshBalance();
       refreshLp();
+      refreshAuto(); // keep the ⚡ button + auto-bet gating in sync with the on-chain grant
       PX.houseStats().then(function (h) { S.house = h; }).catch(function () {}); // cache bankroll for the MAX chip clamp
     });
   }
@@ -460,12 +461,30 @@
     if (S.cfg && chips < PX.toChips(S.cfg.minBet)) { toast("Min bet is " + Math.ceil(PX.toChips(S.cfg.minBet)) + " pts."); beep(160, 60, "sawtooth"); return; }
     if (S.bal != null && S.bal < chips) { el.getpts.hidden = false; beep(160, 60, "sawtooth"); toast(HAS_FAUCET ? "Not enough points — hit the faucet." : "Low $HELIXPOINT — tap GET $HELIXPOINT."); return; }
     var amt = PX.chipsToWei(chips), prov = PX.wallet.provider, from = S.acct, up = side === "up", dur = S.dur;
+    function walletBet() {
+      return ensureAllowance(from, amt).then(function () { return PX.openBet(prov, from, mid, up, amt, dur); });
+    }
     function fire() {
       beep(600, 30); if (navigator.vibrate) navigator.vibrate(12);
       S.pendingOpen[S.asset] = { t: Date.now(), minId: (S.myBets[0] ? S.myBets[0].betId : 0) + 1 };
-      ensureAllowance(from, amt)
-        .then(function () { return PX.openBet(prov, from, mid, up, amt, dur); })
-        .then(function () { flyPoints("bet " + chips, PAL.accent, side); setTimeout(poll, 1500); })
+      // Auto-bet path: the session key signs openBetFor with NO popup, if a live grant covers this stake.
+      var auto = autoReady() && S.auto.budgetLeft >= amt;
+      var submit;
+      if (auto) {
+        submit = PXSession.autoBet(PX.NET.key, from, mid, up, amt, dur).catch(function (e) {
+          // Retry on the wallet ONLY for a pre-broadcast gas shortfall (the tx never went out, so no
+          // double-bet). Any other error (revert, timeout) surfaces — it may have landed.
+          if (e && e.code === "INSUFFICIENT_GAS") {
+            toast("Auto-bet gas low — confirm this one in your wallet, then top up ⚡.");
+            return walletBet();
+          }
+          throw e;
+        });
+      } else {
+        submit = walletBet();
+      }
+      submit
+        .then(function () { flyPoints("bet " + chips, PAL.accent, side); setTimeout(poll, 1500); if (auto) refreshAuto(); })
         .catch(function (e) { delete S.pendingOpen[S.asset]; toast(txErr(e, "Bet failed.")); });
     }
     // Pre-flight the house exposure caps so an oversized bet shows a precise message (with the current
@@ -505,6 +524,23 @@
       })();
     });
   }
+  /* ---------- session-key auto-bet state ---------- */
+  // autoReady = there's a live grant for THIS session key that hasn't expired. budgetLeft is checked
+  // per bet in fire(). Requires window.PXSession (the ESM module) to have loaded.
+  function autoReady() { return !!(window.PXSession && S.auto && S.auto.granted && !S.auto.expired); }
+  function updateAutoBtn() {
+    if (!el.autobtn) return;
+    var on = autoReady();
+    el.autobtn.style.color = on ? "var(--ok)" : "";
+    el.autobtn.style.filter = on ? "drop-shadow(0 0 3px var(--ok))" : "";
+    el.autobtn.title = on ? "auto-bet ON — no popup per tap" : "auto-bet (no popup per tap)";
+  }
+  function refreshAuto() {
+    if (!window.PXSession || !S.acct) { S.auto = null; updateAutoBtn(); return Promise.resolve(); }
+    return PXSession.status(PX.NET.key, S.acct).then(function (st) { S.auto = st; updateAutoBtn(); })
+      .catch(function () { /* leave last-known; a read blip shouldn't flip the UI */ });
+  }
+
   // On testnet the button mints free MockPoints; on mainnet there's no faucet — it links out to
   // buy real $HELIXPOINT instead.
   var HAS_FAUCET = PX.NET.faucet !== false;
@@ -656,6 +692,142 @@
     });
   }
   el.histbtn.onclick = showHistory;
+
+  /* ---------- AUTO-BET (⚡ modal): grant a session key so taps fire with no wallet popup ---------- */
+  function fmtDur(secs) {
+    if (secs <= 0) return "expired";
+    var h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+    return h > 0 ? h + "h " + m + "m" : m + "m";
+  }
+  function showAuto() {
+    var ov = document.createElement("div");
+    ov.id = "automodal";
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(6,11,22,.82);display:flex;align-items:center;justify-content:center;z-index:9998;padding:16px";
+    var box = document.createElement("div");
+    box.style.cssText = "background:var(--panel);border:3px solid;border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt);min-width:300px;max-width:min(96vw,440px);display:flex;flex-direction:column";
+    var hd = document.createElement("div");
+    hd.style.cssText = "display:flex;align-items:center;gap:8px;padding:7px 10px;color:#fff;background:linear-gradient(90deg,var(--stripe-b),var(--stripe-a))";
+    hd.innerHTML = "<span style='flex:1;font-family:var(--comic);font-weight:bold'>⚡ AUTO-BET</span>";
+    var x = document.createElement("button"); x.className = "tbtn"; x.textContent = "×"; x.onclick = function () { document.body.removeChild(ov); };
+    hd.appendChild(x); box.appendChild(hd);
+    var body = document.createElement("div");
+    body.style.cssText = "padding:12px;font-family:var(--mono);font-size:12px;display:flex;flex-direction:column;gap:9px";
+    box.appendChild(body);
+    var msg = document.createElement("div");
+    msg.style.cssText = "min-height:15px;color:var(--accent-2);font-size:11px";
+    function status(t) { msg.textContent = t || ""; }
+
+    var noPX = !window.PXSession;
+    function inputRow(label, value, sym) {
+      var row = document.createElement("label");
+      row.style.cssText = "display:flex;align-items:center;gap:8px;justify-content:space-between";
+      var sp = document.createElement("span"); sp.textContent = label; sp.style.opacity = ".8";
+      var inp = document.createElement("input"); inp.type = "text"; inp.value = value;
+      inp.style.cssText = "width:120px;text-align:right;font-family:var(--mono);padding:3px 6px;border:2px inset var(--bevel-dk);background:var(--panel-2);color:var(--ink)";
+      var wrap2 = document.createElement("span"); wrap2.style.cssText = "display:flex;align-items:center;gap:4px";
+      wrap2.appendChild(inp); var u = document.createElement("span"); u.textContent = sym; u.style.opacity = ".6"; wrap2.appendChild(u);
+      row.appendChild(sp); row.appendChild(wrap2); row.__input = inp; return row;
+    }
+    function btn(label, primary) {
+      var b = document.createElement("button"); b.textContent = label;
+      b.className = primary ? "getpts" : "tbtn";
+      b.style.cssText = (primary ? "" : "border:2px outset var(--bevel-lt);background:var(--panel-2);color:var(--ink);") + "padding:7px 10px;font-family:var(--comic);font-weight:bold;cursor:pointer";
+      return b;
+    }
+
+    function render() {
+      body.innerHTML = "";
+      if (!S.acct) { body.appendChild(txt("Connect a wallet to enable auto-bet.")); body.appendChild(msg); return; }
+      if (noPX) { body.appendChild(txt("Signer still loading — try again in a moment.")); body.appendChild(msg); return; }
+      var a = S.auto;
+      if (a && a.granted && !a.expired) {
+        // ---- STATUS view ----
+        var left = a.expiry - Math.floor(Date.now() / 1000);
+        var gasInj = PX.toChips(a.gas);
+        var lowGas = a.gas < (PXSession.GAS_LIMIT * 2n * 1000000000n); // ~2 bets of headroom at 1 gwei-ish
+        body.appendChild(kv("Status", "ON — taps fire with no popup", "var(--ok)"));
+        body.appendChild(kv("Session key", short(a.address), null));
+        body.appendChild(kv("Budget left", Math.floor(PX.toChips(a.budgetLeft)).toLocaleString("en-US") + " / " + Math.floor(PX.toChips(a.maxSpend)).toLocaleString("en-US") + " " + SYM, null));
+        body.appendChild(kv("Per-bet max", Math.floor(PX.toChips(a.maxStake)).toLocaleString("en-US") + " " + SYM, null));
+        body.appendChild(kv("Expires in", fmtDur(left), left < 3600 ? "var(--bad)" : null));
+        body.appendChild(kv("Gas", gasInj.toFixed(4) + " INJ", lowGas ? "var(--bad)" : null));
+        var rowb = document.createElement("div"); rowb.style.cssText = "display:flex;gap:8px;margin-top:4px";
+        var top = btn("TOP UP GAS"); top.onclick = function () {
+          status("Sending 0.05 INJ to the session key — confirm in wallet…");
+          PXSession.topupGas(PX.wallet.provider, S.acct, a.address, injWei(0.05))
+            .then(function () { status("Gas topped up."); setTimeout(function () { refreshAuto().then(render); }, 2500); })
+            .catch(function (e) { status(txErr(e, "Top-up failed.")); });
+        };
+        var off = btn("DISABLE"); off.onclick = function () {
+          status("Revoke — confirm in wallet…");
+          PXSession.revoke(PX.wallet.provider, S.acct)
+            .then(function () { status("Sweeping leftover gas back…"); return PXSession.sweepGas(PX.NET.key, S.acct).catch(function () { return null; }); })
+            .then(function () { status("Auto-bet off."); setTimeout(function () { refreshAuto().then(render); }, 2500); })
+            .catch(function (e) { status(txErr(e, "Disable failed.")); });
+        };
+        rowb.appendChild(top); rowb.appendChild(off); body.appendChild(rowb);
+      } else {
+        // ---- SETUP form ----
+        body.appendChild(txt("Approve a budget once, then tap UP/DOWN with no wallet popup. A browser key signs your bets and pays its own gas. It can spend at most the budget, expires in 24h, and you can revoke anytime."));
+        var biggest = (PX.NET.chips && PX.NET.chips[PX.NET.chips.length - 1]) || 100;
+        var maxBetChips = S.cfg && S.cfg.maxBet ? PX.toChips(S.cfg.maxBet) : biggest;
+        var defStake = Math.floor(Math.min(maxBetChips, biggest));
+        var defBudget = Math.floor(Math.min(S.bal != null ? S.bal : biggest * 10, biggest * 10));
+        var rBudget = inputRow("Session budget", defBudget, SYM);
+        var rStake = inputRow("Per-bet max", defStake, SYM);
+        var rGas = inputRow("Gas top-up", "0.05", "INJ");
+        body.appendChild(rBudget); body.appendChild(rStake); body.appendChild(rGas);
+        body.appendChild(kv("Expires", "in 24h (revoke anytime)", null));
+        var go = btn("ENABLE AUTO-BET", true); go.style.marginTop = "4px";
+        go.onclick = function () {
+          var budget = parseFloat(rBudget.__input.value), stake = parseFloat(rStake.__input.value), inj = parseFloat(rGas.__input.value);
+          if (!(budget > 0) || !(stake > 0)) { status("Enter a budget and per-bet max."); return; }
+          if (stake > budget) { status("Per-bet max can't exceed the budget."); return; }
+          if (S.cfg && stake > PX.toChips(S.cfg.maxBet)) { status("Per-bet max is above the house maxBet."); return; }
+          go.disabled = true;
+          doEnable(budget, stake, inj || 0.05, status).then(function () { setTimeout(function () { refreshAuto().then(render); }, 2500); })
+            .catch(function () { go.disabled = false; });
+        };
+        body.appendChild(go);
+      }
+      body.appendChild(msg);
+    }
+    function txt(t) { var d = document.createElement("div"); d.style.cssText = "opacity:.8;line-height:1.5"; d.textContent = t; return d; }
+    function kv(k, v, col) {
+      var d = document.createElement("div"); d.style.cssText = "display:flex;justify-content:space-between;gap:10px";
+      d.innerHTML = "<span style='opacity:.7'>" + k + "</span><span style='font-weight:bold" + (col ? ";color:" + col : "") + "'>" + v + "</span>"; return d;
+    }
+    render();
+    // pull a fresh grant/gas read when the modal opens
+    if (S.acct && !noPX) refreshAuto().then(render);
+    ov.appendChild(box);
+    ov.onclick = function (e) { if (e.target === ov) document.body.removeChild(ov); };
+    document.body.appendChild(ov);
+  }
+  var SYM = (PX.NET.stakeSymbol === "$HELIXPOINT") ? "$HLX" : "pts";
+  function short(a) { return a ? a.slice(0, 6) + "…" + a.slice(-4) : "—"; }
+  function injWei(inj) { return BigInt(Math.round(inj * 1e6)) * (10n ** 12n); } // INJ is 18-dec
+  // The one-time enable: approve budget (if allowance short) -> grantSession -> fund the key's gas.
+  function doEnable(budgetChips, stakeChips, inj, status) {
+    var from = S.acct, prov = PX.wallet.provider;
+    var maxSpendWei = PX.chipsToWei(budgetChips), maxStakeWei = PX.chipsToWei(stakeChips);
+    var key = PXSession.ensureKey(PX.NET.key, from).address;
+    var expiry = Math.floor(Date.now() / 1000) + 86340; // ~24h, just under MAX_SESSION to clear the bound
+    status("Approve budget — confirm in wallet…");
+    return PX.allowance(from, PX.NET.book).then(function (a) {
+      return a >= maxSpendWei ? null : PXSession.approve(prov, from, maxSpendWei);
+    }).then(function () {
+      status("Grant the session key — confirm in wallet…");
+      return PXSession.grant(prov, from, key, maxStakeWei, expiry, maxSpendWei);
+    }).then(function () {
+      status("Fund gas (" + inj + " INJ) — confirm in wallet…");
+      return PXSession.topupGas(prov, from, key, injWei(inj));
+    }).then(function () {
+      status("Auto-bet ON — tap UP/DOWN, no more popups.");
+      flyPoints("⚡ AUTO ON", PAL.ok, "up");
+    }).catch(function (e) { status(txErr(e, "Enable failed.")); throw e; });
+  }
+  if (el.autobtn) el.autobtn.onclick = showAuto;
 
   /* ---------- MY STATS (🏆 modal): personal P&L from positionsOf, no backend ---------- */
   // net P&L per bet reconstructed from the Position (the struct has result+stake+payoutBps but not
