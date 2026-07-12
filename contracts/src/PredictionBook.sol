@@ -61,6 +61,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     uint256 public constant MAX_PAYOUT_BPS = 19900; // < 2.00x so the house edge stays positive
     uint256 public constant MAX_EXPOSURE_BPS = 5000; // caps can never exceed 50% of the bankroll
     uint64 public constant MIN_SETTLE_GRACE = 60; // grace floor: keeper always gets >=60s before a void race
+    uint64 public constant MAX_SESSION = 24 hours; // hard cap on a session-key grant's lifetime
 
     IPyth public immutable pyth;
     HouseVault public immutable vault;
@@ -116,11 +117,24 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         int64 close; // pinned at settle
     }
 
+    /// @dev A browser session key a bettor authorises to open bets on their behalf (openBetFor), so the
+    /// arcade UI can fire bets without a wallet popup per tap. Blast radius of a stolen key is bounded by
+    /// THREE on-chain walls: maxSpend (cumulative-stake budget, decoupled from the ERC20 allowance),
+    /// maxStake (per bet), and expiry (<= now + MAX_SESSION). revokeSession() kills it instantly.
+    struct Session {
+        address key; // slot 0: 160 + 64
+        uint64 expiry; // grant dies at this timestamp
+        uint128 maxStake; // slot 1: 128 + 128 — max single stake this key may open
+        uint128 maxSpend; // cumulative-stake budget: sum of stakes opened via this key may not exceed it
+        uint128 spent; // slot 2: monotonic odometer of stake wagered via this key (reset on re-grant)
+    }
+
     Market[] public markets;
     Position[] public positions;
     mapping(address => uint256) public openCount; // concurrent OPEN positions
     mapping(address => uint256[]) private _userPositions; // all betIds per user (paged views)
     mapping(uint256 => uint256) public owed; // betId => amount the bettor can claim (pull payment)
+    mapping(address => Session) public sessions; // bettor => their one active session-key grant
     address private _activeSettler; // set for the duration of a settleMany batch (self-call routing)
 
     event MarketAdded(uint256 indexed marketId, bytes32 indexed feedId);
@@ -164,6 +178,10 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         uint256 tip
     );
     event Claimed(uint256 indexed betId, address indexed bettor, uint256 amount);
+    event SessionGranted(
+        address indexed bettor, address indexed key, uint128 maxStake, uint64 expiry, uint128 maxSpend
+    );
+    event SessionRevoked(address indexed bettor, address indexed key);
 
     error PayoutOutOfRange();
     error ExposureCapTooHigh();
@@ -184,6 +202,11 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     error RefundFailed();
     error OnlySelf();
     error NothingToClaim();
+    error BadSession();
+    error NotSessionKey();
+    error SessionExpired();
+    error SessionStakeExceeded();
+    error SessionBudgetExceeded();
 
     constructor(
         IPyth _pyth,
@@ -326,13 +349,48 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         whenNotPaused
         returns (uint256 betId)
     {
+        return _open(msg.sender, marketId, up, stake, dur);
+    }
+
+    /// @notice Open a position ON BEHALF OF `bettor`, authorised by a session key the bettor granted
+    /// (grantSession). msg.sender must be that key, within the per-bet (maxStake) and cumulative-stake
+    /// (maxSpend) budgets and before expiry. The stake is escrowed from the BETTOR (their allowance),
+    /// the position/winnings accrue to the BETTOR — the session key only signs + pays its own gas.
+    function openBetFor(address bettor, uint256 marketId, bool up, uint256 stake, uint64 dur)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256 betId)
+    {
+        Session storage s = sessions[bettor];
+        if (msg.sender != s.key) revert NotSessionKey();
+        if (block.timestamp >= s.expiry) revert SessionExpired();
+        if (stake > s.maxStake) revert SessionStakeExceeded();
+        // Monotonic budget odometer: cap TOTAL stake wagered via this key, decoupled from the ERC20
+        // allowance (which stays large for manual-betting UX). stake <= maxStake <= maxBet, so it fits
+        // uint128; the checked add reverts on the impossible overflow. NOT reduced on wins — else a
+        // stolen key could churn break-even bets forever under the same budget.
+        // forge-lint: disable-next-line(unsafe-typecast) — stake <= maxStake (uint128) so it fits uint128
+        uint128 newSpent = s.spent + uint128(stake);
+        if (newSpent > s.maxSpend) revert SessionBudgetExceeded();
+        s.spent = newSpent;
+        return _open(bettor, marketId, up, stake, dur);
+    }
+
+    /// @dev Shared open path for openBet (bettor == msg.sender) and openBetFor (bettor set by a session
+    /// key). Escrows `stake` from `bettor`, locks ⌈(m−1)·stake⌉ on the vault under the exposure caps,
+    /// and records the position under `bettor`. Callers carry nonReentrant + whenNotPaused.
+    function _open(address bettor, uint256 marketId, bool up, uint256 stake, uint64 dur)
+        internal
+        returns (uint256 betId)
+    {
         if (marketId >= markets.length) revert NoSuchMarket();
         if (!markets[marketId].enabled) revert MarketDisabled();
         if (stake == 0) revert ZeroAmount();
         if (stake < minBet) revert BetTooSmall();
         if (stake > maxBet) revert BetTooBig();
         if (dur < minDur || dur > maxDur) revert BadDuration();
-        if (openCount[msg.sender] >= maxOpenPerUser) revert TooManyOpen();
+        if (openCount[bettor] >= maxOpenPerUser) revert TooManyOpen();
 
         uint256 m = payoutBps;
         uint256 reserve = _ceilDiv(stake * (m - BPS), BPS); // ⌈(m−1)·stake⌉, no netting
@@ -340,7 +398,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         if (reserve > _bps(bankroll, maxBetExposureBps)) revert BetCapExceeded();
         if (vault.reservedExposure() + reserve > _bps(bankroll, maxAggExposureBps)) revert AggCapExceeded();
 
-        stakeToken.safeTransferFrom(msg.sender, address(this), stake);
+        stakeToken.safeTransferFrom(bettor, address(this), stake);
         vault.reserve(reserve); // also reverts if it would break vault solvency
 
         // forge-lint: disable-next-line(unsafe-typecast) — block.timestamp fits uint64 for ~5.8e11 years
@@ -348,7 +406,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         betId = positions.length;
         positions.push(
             Position({
-                bettor: msg.sender,
+                bettor: bettor,
                 // forge-lint: disable-next-line(unsafe-typecast) — marketId < markets.length, bounded << 2^32
                 marketId: uint32(marketId),
                 // forge-lint: disable-next-line(unsafe-typecast) — m <= MAX_PAYOUT_BPS (19900) fits uint32
@@ -363,10 +421,31 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
                 close: 0
             })
         );
-        openCount[msg.sender] += 1;
-        _userPositions[msg.sender].push(betId);
+        openCount[bettor] += 1;
+        _userPositions[bettor].push(betId);
         // forge-lint: disable-next-line(unsafe-typecast) — m <= MAX_PAYOUT_BPS (19900) fits uint32
-        emit BetOpened(betId, msg.sender, marketId, up, stake, strikeInstant, dur, uint32(m), reserve);
+        emit BetOpened(betId, bettor, marketId, up, stake, strikeInstant, dur, uint32(m), reserve);
+    }
+
+    /// @notice Authorise a browser `key` to open bets on the caller's behalf (openBetFor). Overwrites
+    /// any prior grant and RESETS the spend odometer. `maxSpend` (cumulative stake) is the real risk
+    /// budget; `maxStake` caps a single bet; `expiry` must be within MAX_SESSION. One grant per bettor.
+    function grantSession(address key, uint128 maxStake, uint64 expiry, uint128 maxSpend) external {
+        if (key == address(0)) revert BadSession();
+        if (expiry <= block.timestamp || expiry > block.timestamp + MAX_SESSION) revert BadSession();
+        if (maxStake == 0 || uint256(maxStake) > maxBet) revert BadSession();
+        if (maxSpend < maxStake) revert BadSession();
+        sessions[msg.sender] =
+            Session({key: key, expiry: expiry, maxStake: maxStake, maxSpend: maxSpend, spent: 0});
+        emit SessionGranted(msg.sender, key, maxStake, expiry, maxSpend);
+    }
+
+    /// @notice Instantly kill the caller's session key. NOT whenNotPaused-gated — a user must always be
+    /// able to revoke, including during a pause.
+    function revokeSession() external {
+        address key = sessions[msg.sender].key;
+        delete sessions[msg.sender];
+        emit SessionRevoked(msg.sender, key);
     }
 
     /// @notice Settle a matured bet. Pays the caller a tip from escrow, so a keeper (or anyone) is
