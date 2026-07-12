@@ -237,6 +237,32 @@
   //   • matured + Open           -> "settling" (the keeper is on it; usually seconds)
   //   • matured + Open past grace -> "stuck"    -> REFUND (voidExpired, no oracle needed)
   //   • settled Win/Void, owed>0  -> "unclaimed" -> CLAIM  (a failed/rejected auto-claim landed here)
+  // Unbounded background sweep: page ALL of the user's positions and read owed for the ones we haven't
+  // already seen drain to 0 (S.owedZero cache), so an OLD unclaimed win that scrolled past the recent
+  // window is still surfaced (owed never expires -> no silent stranding). Throttled + cached so it's not
+  // a per-poll storm; reads run in small sequential batches so it doesn't hammer the RPC.
+  var SWEEP_MS = 45000, _lastSweep = 0, _sweeping = false;
+  function sweepUnclaimed() {
+    if (!S.acct || _sweeping || Date.now() - _lastSweep < SWEEP_MS) return;
+    _sweeping = true;
+    var acct = S.acct, ids = [];
+    (function page(start) {
+      return PX.positionsPage(acct, start, 200).then(function (r) {
+        ids = ids.concat(r.ids);
+        if (start + 200 < r.total && ids.length < 4000) return page(start + 200);
+      });
+    })(0).then(function () {
+      var todo = ids.filter(function (id) { return !S.owedZero[id]; }), found = {};
+      return (function batch(i) {
+        if (i >= todo.length) return;
+        return Promise.all(todo.slice(i, i + 15).map(function (id) {
+          return PX.owed(id).then(function (w) {
+            if (w <= 0n) { S.owedZero[id] = true; delete S.claiming[id]; } else found[id] = w;
+          }).catch(function () {});
+        })).then(function () { return batch(i + 15); });
+      })(0).then(function () { S.sweep = found; });
+    }).catch(function () {}).then(function () { _sweeping = false; _lastSweep = Date.now(); });
+  }
   function computePending() {
     var now = Date.now(), grace = (S.cfg && S.cfg.settleGrace ? S.cfg.settleGrace : 3600) * 1000;
     var settling = 0, refundable = [], winVoid = [];
@@ -249,14 +275,23 @@
         winVoid.push(p.betId); // owed>0 only if a claim never landed
       }
     });
-    // read owed only for a bounded set of recent settled Win/Void bets (usually 0 after auto-claim)
+    sweepUnclaimed(); // throttled full scan -> S.sweep (async, catches stranded old wins)
+    // fast path: read owed for recent settled Win/Void. owed->0 CONFIRMS a claim (clears the dedupe guard);
+    // owed still >0 after CLAIM_RETRY_MS means a claim never landed (or OOG-reverted silently) -> retry.
     var check = winVoid.slice(0, 12).filter(function (id) { return !S.owedZero[id]; });
     Promise.all(check.map(function (id) {
-      return PX.owed(id).then(function (w) { if (w <= 0n) S.owedZero[id] = true; return { id: id, owed: w }; }).catch(function () { return { id: id, owed: 0n }; });
+      return PX.owed(id).then(function (w) { if (w <= 0n) { S.owedZero[id] = true; delete S.claiming[id]; } return { id: id, owed: w }; }).catch(function () { return { id: id, owed: 0n }; });
     })).then(function (res) {
-      var unclaimed = res.filter(function (x) { return x.owed > 0n; });
-      var total = unclaimed.reduce(function (s, x) { return s + x.owed; }, 0n);
-      S.pending = { settling: settling, refundable: refundable, unclaimed: unclaimed.map(function (x) { return x.id; }), unclaimedTotal: total };
+      var map = {}; // union the recent fast reads with the throttled full-scan
+      res.forEach(function (x) { if (x.owed > 0n) map[x.id] = x.owed; });
+      var sweep = S.sweep || {};
+      for (var sid in sweep) if (!S.owedZero[sid]) map[sid] = sweep[sid];
+      var ids = Object.keys(map).map(Number), total = 0n;
+      ids.forEach(function (id) { total += map[id]; });
+      // auto users (funded session key): retry-claim anything still owed, no popup. Dedupe/stale-guarded
+      // by fireClaim, so it fires at most once per betId per CLAIM_RETRY_MS and stops once owed->0.
+      if (hasGasKey()) ids.forEach(function (id) { fireClaim(id, true).catch(function () {}); });
+      S.pending = { settling: settling, refundable: refundable, unclaimed: ids, unclaimedTotal: total };
       renderPending();
     });
   }
@@ -283,12 +318,15 @@
     var pg = S.pending || {}, act = el.pendingBtn.dataset.act;
     var ids = act === "claim" ? (pg.unclaimed || []) : act === "refund" ? (pg.refundable || []) : [];
     if (!ids.length) return;
-    var fn = act === "claim" ? PX.claim : PX.voidExpired;
+    // A funded session key claims with no popup; otherwise the wallet is the reliable fallback (works
+    // even when the key is out of gas). fireClaim shares the dedupe guard with the auto path.
+    var viaKey = act === "claim" && hasGasKey();
     el.pendingBtn.hidden = true; // debounce
-    toast(act === "claim" ? "Claiming — confirm in wallet." : "Refunding stuck bet — confirm in wallet.");
-    // fire them sequentially-ish; each is its own wallet confirm
+    toast(act === "claim" ? (viaKey ? "Claiming…" : "Claiming — confirm in wallet.") : "Refunding stuck bet — confirm in wallet.");
     ids.reduce(function (chain, id) {
-      return chain.then(function () { return fn(PX.wallet.provider, S.acct, id).catch(function () {}); });
+      return chain.then(function () {
+        return (act === "claim" ? fireClaim(id, viaKey) : PX.voidExpired(PX.wallet.provider, S.acct, id)).catch(function () {});
+      });
     }, Promise.resolve()).then(function () { setTimeout(poll, 2500); }).catch(function (e) { toast(txErr(e, "Failed — try again.")); });
   };
   function assetOf(marketId) {
@@ -302,8 +340,8 @@
     var res = pos.result; // 1 win, 2 loss, 3 void
     var priceDir = res === PX.RESULT.VOID ? "tie" : (pos.up === (res === PX.RESULT.WIN) ? "up" : "down");
     var mine = res === PX.RESULT.WIN ? "win" : res === PX.RESULT.VOID ? "tie" : "lose";
-    // claim winnings / void refunds
-    if (res === PX.RESULT.WIN || res === PX.RESULT.VOID) maybeClaim(pos.betId);
+    // Winnings/refunds are claimed by computePending (fast owed read + throttled sweep), which drives
+    // the auto session-key claim + retry uniformly — no separate per-settle claim here.
     var stake = PX.toChips(pos.stake), delta = res === PX.RESULT.WIN ? stake * mult() : res === PX.RESULT.VOID ? stake : 0;
     S.hist[a].unshift({ dir: priceDir, mine: mine, delta: Math.floor(delta) });
     S.hist[a] = S.hist[a].slice(0, 16);
@@ -315,13 +353,22 @@
       renderHist();
     }
   }
-  function maybeClaim(betId) {
-    if (!S.acct || S.claiming[betId]) return;
-    PX.owed(betId).then(function (w) {
-      if (w <= 0n || S.claiming[betId]) return;
-      S.claiming[betId] = true;
-      PX.claim(PX.wallet.provider, S.acct, betId).then(function () { setTimeout(poll, 2500); }).catch(function () { delete S.claiming[betId]; });
-    }).catch(function () {});
+  // A funded session key can claim (permissionless) with NO popup — gate on GAS, not the grant (claim
+  // doesn't touch the grant, so a funded key with an expired grant still works). Manual users (no funded
+  // key) don't auto-claim; the pending strip surfaces + sweeps their winnings on demand.
+  function hasGasKey() {
+    return !!(window.PXSession && S.auto && S.auto.gas && S.auto.gas > 300000000000000n); // ~0.0003 INJ (> a few claims)
+  }
+  var CLAIM_RETRY_MS = 15000;
+  // Single claim entry point shared across ALL sites (auto retry, pending strip, history) so one betId
+  // is never double-claimed. The guard is a timestamp: cleared on confirmation (owed->0, in
+  // computePending) or once stale (a silent OOG left owed>0 -> allow a retry). useSession -> no popup.
+  function fireClaim(betId, useSession) {
+    var t = S.claiming[betId];
+    if (t && Date.now() - t < CLAIM_RETRY_MS) return Promise.resolve(); // already in flight -> dedupe
+    S.claiming[betId] = Date.now();
+    var p = useSession ? PXSession.claim(PX.NET.key, S.acct, betId) : PX.claim(PX.wallet.provider, S.acct, betId);
+    return p.then(function () { setTimeout(poll, 2500); }, function (e) { delete S.claiming[betId]; throw e; });
   }
   function refreshBalance() {
     if (!S.acct) { S.bal = null; updateBalance(); return; }
@@ -703,7 +750,7 @@
         var b = document.createElement("button"); b.className = "getpts"; b.textContent = "CLAIM"; b.style.padding = "3px 6px";
         b.onclick = function () {
           b.disabled = true; b.textContent = "…";
-          PX.claim(PX.wallet.provider, S.acct, id).then(function () { b.textContent = "✓"; setTimeout(poll, 2500); })
+          fireClaim(id, hasGasKey()).then(function () { b.textContent = "✓"; setTimeout(poll, 2500); }) // no popup if key funded; shares the guard
             .catch(function (e) { b.disabled = false; b.textContent = "CLAIM"; toast(txErr(e, "Claim failed.")); });
         };
         slot.appendChild(b);
