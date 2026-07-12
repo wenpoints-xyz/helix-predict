@@ -81,6 +81,7 @@
     border:2px solid; border-color:var(--bevel-lt) var(--bevel-dk) var(--bevel-dk) var(--bevel-lt); }
 
   .histbar { display:flex; align-items:center; gap:5px; padding:6px 8px 8px; font-family:var(--mono); font-size:12px; color:var(--ink-dim); overflow:hidden; }
+  .histbar[hidden] { display:none; } /* display:flex above beats the UA [hidden] rule; JS re-shows via inline style.display, which wins over this */
   .hdot { font-size:13px; }
   .hdot.up { color:var(--ok); } .hdot.down { color:var(--bad); } .hdot.tie { color:var(--ink-dim); }
   .hdot.mine { text-decoration:underline; }
