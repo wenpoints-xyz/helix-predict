@@ -12,6 +12,10 @@ Type=simple
 User=helixkeeper
 Group=helixkeeper
 WorkingDirectory=/opt/helix-predict/apps/indexer
+# HOME + npm cache under the one ReadWritePath so `npx wrangler` (the publish step) can cache/run
+# under ProtectHome=true. First publish downloads wrangler here; later ones are cached.
+Environment=HOME=/opt/helix-predict/apps/indexer
+Environment=NPM_CONFIG_CACHE=/opt/helix-predict/apps/indexer/.npm
 EnvironmentFile=/opt/helix-predict/apps/indexer/.env.mainnet
 ExecStart=/usr/local/bin/node --experimental-sqlite src/indexer.js
 Restart=always

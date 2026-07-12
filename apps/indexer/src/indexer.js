@@ -11,6 +11,7 @@
 //   unset, the JSON is only written locally (useful for --once / dry runs).
 import { spawnSync } from "node:child_process";
 import { writeFileSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { openDb, getCursor, setCursor, upsertOpened, applySettled, allRows } from "./db.js";
 import { makeRpc, blockNumber, getLogsPaged } from "./rpc.js";
@@ -52,18 +53,26 @@ async function tick() {
   return maybePublish(target, target);
 }
 
-// Cold-start gate: only publish once the cursor has caught the lagged head (no partial board mid-backfill).
+// Cold-start gate: only publish once the cursor has caught the lagged head (no partial board
+// mid-backfill). The rolling time-windows mean the board can change even with no new bets, so we key
+// the "did it change" check on the aggregated body (minus generatedAt), and only re-run the (heavy,
+// CDN-deploying) PUBLISH_CMD when that body actually differs from what we last pushed.
+let _lastHash = null;
 function maybePublish(cursor, target) {
   if (cursor < target) { log(`backfilling (cursor ${cursor} < target ${target}) — hold publish`); return; }
   const rows = allRows(db);
   const now = Math.floor(Date.now() / 1000);
   const lb = buildLeaderboard(rows, now, { book: BOOK, fromBlock: DEPLOY_BLOCK });
+  const body = JSON.stringify(lb.windows); // ignore generatedAt when deciding if anything changed
+  const hash = createHash("sha256").update(body).digest("hex");
   const file = join(OUT_DIR, "leaderboard.json");
   writeFileSync(file, JSON.stringify(lb));
-  log(`published ${file}: ${rows.length} bets, ${lb.windows.all.players.length} players`);
+  if (hash === _lastHash) { return; } // unchanged board — skip the redeploy
+  _lastHash = hash;
+  log(`publish ${file}: ${rows.length} bets, ${lb.windows.all.players.length} players`);
   if (PUBLISH_CMD) {
     const r = spawnSync(PUBLISH_CMD, { shell: true, stdio: "inherit" });
-    if (r.status !== 0) log(`PUBLISH_CMD exited ${r.status}`);
+    if (r.status !== 0) { log(`PUBLISH_CMD exited ${r.status}`); _lastHash = null; } // retry next tick
   }
 }
 
