@@ -41,6 +41,6 @@ Runs as `helixkeeper` with `MemoryMax=256M`, `ProtectSystem=strict`. Its RPC bud
 the keeper so a backfill burst can't throttle settlement.
 
 ## Data
-- Mainnet book `0x98121Af94Ece69bFEC46544ff0Fc202F30010956`, deploy block `173753444` (cursor seed).
+- Mainnet book `0x8034a103CaA6c2982995d39E6A95F83B367738d0`, deploy block `173871456` (book v2 with session-key openBetFor; v1 0x98121Af9 was replaced 2026-07-12) (cursor seed).
 - Published to https://helix-leaderboard.pages.dev/leaderboard.json (CORS `*`, short TTL; frontend
   cache-busts with `?t=<epoch>`).

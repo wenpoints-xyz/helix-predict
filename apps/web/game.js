@@ -768,7 +768,20 @@
           PXSession.revoke(PX.wallet.provider, S.acct)
             .then(function () { status("Sweeping leftover gas back…"); return PXSession.sweepGas(PX.NET.key, S.acct).catch(function () { return null; }); })
             .then(function () { status("Auto-bet off."); setTimeout(function () { refreshAuto().then(render); }, 2500); })
-            .catch(function (e) { status(txErr(e, "Disable failed.")); });
+            .catch(function (e) {
+              if (e && e.code === 4001) { status("Cancelled."); return; } // user said no — keep the session
+              // Wallet path is broken (wrong chain / account / locked). Disable must ALWAYS work, so fall
+              // back to a local kill: sweep the key's gas home, then delete the key — with it gone the
+              // on-chain grant is inert (nobody can sign) and simply idles out at expiry.
+              status(txErr(e, "Wallet revoke failed") + " — stopping auto-bet on this device…");
+              PXSession.sweepGas(PX.NET.key, S.acct).catch(function () { return null; }).then(function () {
+                PXSession.dropKey(PX.NET.key, S.acct);
+                var left = a.expiry ? fmtDur(a.expiry - Math.floor(Date.now() / 1000)) : "24h";
+                S.auto = null; updateAutoBtn();
+                status("Auto-bet OFF (key deleted from this browser). The unused grant expires in " + left + "; you can also revoke it from your wallet later.");
+                setTimeout(function () { refreshAuto().then(render); }, 3500);
+              });
+            });
         };
         top.style.flex = "1"; off.style.flex = "1"; // share the row evenly instead of collapsing
         rowb.appendChild(top); rowb.appendChild(off); body.appendChild(rowb);

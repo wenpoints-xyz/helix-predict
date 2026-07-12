@@ -249,10 +249,32 @@ if (typeof window !== "undefined") {
   }
 
   // ---- writes via the MAIN wallet (popups — one-time setup / teardown) ----
+  // Preflight before every wallet write. Once auto-bet is on, taps sign via raw RPC and the WALLET is
+  // never touched — so by the time the user needs it again (top-up / DISABLE) it may have drifted to
+  // another chain or account. Sending blind then either errors opaquely or, worse, lands the tx on the
+  // wrong chain. Re-sync the chain (propagate a refused switch — never send cross-chain) and verify
+  // the active account still matches `from`.
+  function walletPreflight(provider, from) {
+    return provider.request({ method: "eth_chainId" }).then(function (cid) {
+      if (cid === NET().chainIdHex) return;
+      return provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: NET().chainIdHex }] });
+    }).then(function () {
+      return provider.request({ method: "eth_accounts" }).then(function (accts) {
+        var a = ((accts && accts[0]) || "").toLowerCase();
+        if (a && from && a !== from.toLowerCase()) {
+          var e = new Error("wallet is on account " + a.slice(0, 6) + "… — switch it back to " + from.slice(0, 6) + "…");
+          e.code = "ACCOUNT_MISMATCH";
+          throw e;
+        }
+      });
+    });
+  }
   function walletTx(provider, from, to, data, valueWei) {
     var p = { from: from, to: to, data: data };
     if (valueWei) p.value = "0x" + BigInt(valueWei).toString(16);
-    return provider.request({ method: "eth_sendTransaction", params: [p] });
+    return walletPreflight(provider, from).then(function () {
+      return provider.request({ method: "eth_sendTransaction", params: [p] });
+    });
   }
   function approve(provider, from, amountWei) {
     return walletTx(provider, from, NET().points, SEL_APPROVE + _addr32(NET().book) + _u256(amountWei));
