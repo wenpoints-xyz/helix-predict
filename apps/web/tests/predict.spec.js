@@ -25,16 +25,18 @@ const SEL = {
   balanceOf: "0x70a08231", allowance: "0xdd62ed3e",
   openBet: "0x058a345d", claim: "0x379607f5", faucet: "0x57915897", approve: "0x095ea7b3",
   houseStats: "0xaa608dbb", deposit: "0x6e553f65", withdraw: "0xb460af94", maxWithdraw: "0xce96cb77",
-  openBetFor: "0x804f7759", grantSession: "0x076fa699", revokeSession: "0xc4605d8c", sessions: "0x431a1b97"
+  openBetFor: "0x804f7759", grantSession: "0x65cb5614", revokeSession: "0xc4605d8c", sessions: "0x431a1b97",
+  claimMany: "0x925489a8", openCost: "0x5073a663"
 };
+const OPEN_COST = 11500000000000000n; // ~0.0115 INJ, v3 settle-fee escrow (mock openCost())
 // A known session key used by the auto-bet tests: priv -> derived EOA address (matches session.js).
 const SESS_PRIV = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 const SESS_ADDR = "0x639d6caadb5617d324c1ad0becb16262fc58ce5f";
-// sessions(bettor) -> (address key, uint64 expiry, uint128 maxStake, uint128 maxSpend, uint128 spent)
+// sessions(bettor) -> (address key, uint64 expiry, uint128 maxSpend, uint128 spent)  [v3: no maxStake]
 function sessionsResult(s) {
   s = s || {};
   const key = (s.key || "0x0000000000000000000000000000000000000000").toLowerCase().replace(/^0x/, "").padStart(64, "0");
-  return "0x" + key + u(s.expiry || 0) + u(s.maxStake || 0n) + u(s.maxSpend || 0n) + u(s.spent || 0n);
+  return "0x" + key + u(s.expiry || 0) + u(s.maxSpend || 0n) + u(s.spent || 0n);
 }
 
 const u = (v) => BigInt(v).toString(16).padStart(64, "0");
@@ -42,11 +44,12 @@ const lastWord = (data) => BigInt("0x" + data.slice(-64)); // decode a single ui
 
 // markets(i) -> (bytes32 feedId, bool enabled)
 function market(i) { return "0x" + FEED_LIST[Number(i)] + u(1); }
-// getPosition -> Position (11 static fields, inline)
+// getPosition -> Position (12 static fields, inline; +feeEscrow in v3)
 function position(p) {
   const addr = (p.bettor || ACCT).toLowerCase().replace(/^0x/, "").padStart(64, "0");
   return "0x" + addr + u(p.marketId || 0) + u(p.payoutBps || 19500) + u(p.up ? 1 : 0) + u(p.result || 0)
-    + u(p.stake || 0n) + u(p.reserve || 0n) + u(p.strikeInstant || 0) + u(p.dur || 0) + u(p.strike || 0) + u(p.close || 0);
+    + u(p.stake || 0n) + u(p.reserve || 0n) + u(p.strikeInstant || 0) + u(p.dur || 0) + u(p.strike || 0) + u(p.close || 0)
+    + u(p.feeEscrow || 0n);
 }
 // positionsOf -> (uint256[] ids, uint256 total)
 function positionsOf(ids) {
@@ -95,6 +98,7 @@ async function setup(page, opts) {
         result = "0x" + u(v);
       }
       else if (sel === SEL.sessions) result = sessionsResult(opts.session);
+      else if (sel === SEL.openCost) result = "0x" + u(OPEN_COST);
     } else if (req.method === "eth_blockNumber") result = "0x1";
     else if (req.method === "eth_getBalance") result = "0x" + (opts.sessionGas != null ? opts.sessionGas : 10n ** 18n).toString(16); // INJ gas (1 INJ default)
     else if (req.method === "eth_gasPrice") result = "0x" + (1000000000n).toString(16); // 1 gwei
@@ -420,7 +424,7 @@ test("auto-bet: a live session grant lights the ⚡ button (granted status)", as
   const future = Math.floor(Date.now() / 1000) + 3600;
   await setup(page, {
     balance: 1000n * E18, allowance: (1n << 255n), sessionPriv: SESS_PRIV,
-    session: { key: SESS_ADDR, expiry: future, maxStake: 500n * E18, maxSpend: 1000n * E18, spent: 0n }
+    session: { key: SESS_ADDR, expiry: future, maxSpend: 1000n * E18, spent: 0n }
   });
   await page.goto("/");
   await page.click("#connect");
@@ -432,7 +436,7 @@ test("auto-bet: with a grant, tapping fires openBetFor as a raw tx (NO wallet po
   const future = Math.floor(Date.now() / 1000) + 3600;
   await setup(page, {
     balance: 1000n * E18, allowance: (1n << 255n), sessionPriv: SESS_PRIV,
-    session: { key: SESS_ADDR, expiry: future, maxStake: 500n * E18, maxSpend: 1000n * E18, spent: 0n }
+    session: { key: SESS_ADDR, expiry: future, maxSpend: 1000n * E18, spent: 0n }
   });
   await page.goto("/");
   await page.click("#connect");
@@ -448,7 +452,7 @@ test("auto-bet: a pre-broadcast gas shortfall falls back to a wallet openBet (ex
   const future = Math.floor(Date.now() / 1000) + 3600;
   await setup(page, {
     balance: 1000n * E18, allowance: (1n << 255n), sessionPriv: SESS_PRIV, sessionGas: 0n, rawFail: true,
-    session: { key: SESS_ADDR, expiry: future, maxStake: 500n * E18, maxSpend: 1000n * E18, spent: 0n }
+    session: { key: SESS_ADDR, expiry: future, maxSpend: 1000n * E18, spent: 0n }
   });
   await page.goto("/");
   await page.click("#connect");
@@ -518,7 +522,7 @@ test("auto-claim: bet + claim from one session key get DISTINCT nonces (serializ
   const raws = rawSendCollector(page);
   await setup(page, {
     sessionPriv: SESS_PRIV, sessionGas: 10n ** 18n, balance: 1000n * E18, allowance: (1n << 255n),
-    session: { key: SESS_ADDR, expiry: future, maxStake: 500n * E18, maxSpend: 1000n * E18, spent: 0n },
+    session: { key: SESS_ADDR, expiry: future, maxSpend: 1000n * E18, spent: 0n },
     ids: [6], owed: 195n * E18, // a settled win -> auto-claim fires concurrently with the tap-bet
     pos: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, strikeInstant: now - 60, dur: 15, strike: 100, close: 200 }
   });
@@ -529,4 +533,36 @@ test("auto-claim: bet + claim from one session key get DISTINCT nonces (serializ
   await expect.poll(() => raws.length).toBeGreaterThanOrEqual(2); // at least the bet + the claim went out
   const nonces = raws.map(txNonce);
   expect(new Set(nonces).size).toBe(nonces.length); // every raw send has a UNIQUE nonce (no collision)
+});
+
+// ---- v3 fee escrow (frontend) ----
+test("v3: a wallet bet attaches the INJ oracle-fee escrow (value >= openCost)", async ({ page }) => {
+  await setup(page, { balance: 1000n * E18, allowance: (1n << 255n), sessionGas: 0n }); // manual -> wallet openBet
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#feeline")).toContainText(/oracle fee/); // fee line shows
+  await upZoneClick(page);
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.openBet);
+  const sent = await page.evaluate(() => window.__sent.map((t) => ({ sel: (t.data || "").slice(0, 10), value: t.value || "0x0" })));
+  const bet = sent.find((t) => t.sel === SEL.openBet);
+  expect(BigInt(bet.value) >= OPEN_COST).toBeTruthy(); // attached at least openCost (over-attached ~1.15x)
+});
+
+test("v3: CASH OUT ALL claims multiple wins in ONE claimMany tx", async ({ page }) => {
+  const now = Math.floor(Date.now() / 1000);
+  await setup(page, {
+    ids: [6, 7], sessionGas: 0n, owedById: { 6: 195n * E18, 7: 195n * E18 },
+    byId: {
+      6: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, strikeInstant: now - 60, dur: 15, strike: 100, close: 200 },
+      7: { bettor: ACCT, marketId: 0, up: true, result: 1, stake: 100n * E18, strikeInstant: now - 60, dur: 15, strike: 100, close: 200 }
+    }
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect(page.locator("#pendingMsg")).toHaveText(/ready to claim/);
+  await page.click("#pendingBtn");
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.claimMany);
+  const txs = await page.evaluate(() => window.__sent.map((t) => (t.data || "").slice(0, 10)));
+  expect(txs.filter((s) => s === SEL.claimMany).length).toBe(1); // exactly one bulk claim
+  expect(txs.find((s) => s === SEL.claim)).toBeUndefined(); // not N single claims
 });
