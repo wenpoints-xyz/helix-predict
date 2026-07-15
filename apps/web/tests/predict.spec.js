@@ -464,6 +464,27 @@ test("auto-bet: a pre-broadcast gas shortfall falls back to a wallet openBet (ex
   expect(txs.filter((t) => t.sel === SEL.openBet).length).toBe(1); // one bet, no double-fire
 });
 
+test("auto-bet: TOP UP BUDGET re-grants the SAME key with (budget left + added) as the new maxSpend", async ({ page }) => {
+  const future = Math.floor(Date.now() / 1000) + 3600;
+  await setup(page, {
+    balance: 1000n * E18, allowance: (1n << 255n), sessionPriv: SESS_PRIV,
+    session: { key: SESS_ADDR, expiry: future, maxSpend: 1000n * E18, spent: 200n * E18 } // 800 left
+  });
+  await page.goto("/");
+  await page.click("#connect");
+  await expect.poll(() => page.evaluate(() => document.getElementById("autobtn").style.color)).not.toBe("");
+  await page.click("#autobtn"); // grant is live -> the ⚡ modal opens on the STATUS view
+  const modal = page.locator("#automodal");
+  await modal.locator("input").first().fill("500");
+  await modal.getByRole("button", { name: /ADD/ }).click();
+  // grantSession goes out via the wallet; new maxSpend = 800 (left) + 500 = 1300, SAME key
+  await page.waitForFunction((s) => window.__sent.some((t) => (t.data || "").startsWith(s)), SEL.grantSession);
+  const g = (await page.evaluate(() => window.__sent.map((t) => t.data || ""))).find((d) => d.startsWith(SEL.grantSession));
+  expect(g).toBeTruthy();
+  expect(g.slice(10, 74).slice(-40)).toBe(SESS_ADDR.replace(/^0x/, "")); // key unchanged
+  expect(BigInt("0x" + g.slice(-64))).toBe(1300n * E18);                 // maxSpend = left + added
+});
+
 
 // ---- auto-claim (session key) ----
 // Decode the nonce out of a signed legacy tx (RLP list: [nonce, gasPrice, ...]). Small nonces only.

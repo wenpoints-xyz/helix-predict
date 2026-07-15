@@ -840,6 +840,22 @@
         body.appendChild(kv("Budget left", Math.floor(PX.toChips(a.budgetLeft)).toLocaleString("en-US") + " / " + Math.floor(PX.toChips(a.maxSpend)).toLocaleString("en-US") + " " + SYM, null));
         body.appendChild(kv("Expires in", fmtDur(left), left < 3600 ? "var(--bad)" : null));
         body.appendChild(kv("Gas", gasInj.toFixed(4) + " INJ", lowGas ? "var(--bad)" : null));
+        // ---- add more budget: re-grant with (budget left + this amount); also refreshes the 24h timer ----
+        var rowAdd = document.createElement("div"); rowAdd.style.cssText = "display:flex;gap:8px;align-items:center;margin-top:8px";
+        var addInp = document.createElement("input"); addInp.type = "text"; addInp.value = String((PX.NET.chips && PX.NET.chips[PX.NET.chips.length - 1]) || 100);
+        addInp.style.cssText = "flex:1;min-width:0;text-align:right;font-family:var(--mono);padding:8px;border:2px inset var(--bevel-dk);background:var(--panel-2);color:var(--ink)";
+        var addBtn = btn("+ ADD " + SYM, true);
+        addBtn.onclick = function () {
+          var add = parseFloat(addInp.value);
+          if (!(add > 0)) { status("Enter an amount to add."); return; }
+          addBtn.disabled = true;
+          var newMax = a.budgetLeft + PX.chipsToWei(add); // additive on the CURRENT remaining budget
+          status("Topping up budget — approve/grant in wallet…");
+          doTopUpBudget(a.address, newMax, status)
+            .then(function () { setTimeout(function () { refreshAuto().then(render); }, 2500); })
+            .catch(function () { addBtn.disabled = false; });
+        };
+        rowAdd.appendChild(addInp); rowAdd.appendChild(addBtn); body.appendChild(rowAdd);
         var rowb = document.createElement("div"); rowb.style.cssText = "display:flex;gap:8px;margin-top:4px";
         var top = btn("TOP UP GAS"); top.onclick = function () {
           status("Sending 0.25 INJ to the session key — confirm in wallet…");
@@ -926,6 +942,22 @@
       status("Auto-bet ON — tap UP/DOWN, no more popups.");
       flyPoints("⚡ AUTO ON", PAL.ok, "up");
     }).catch(function (e) { status(txErr(e, "Enable failed.")); throw e; });
+  }
+  // Add budget to a LIVE session: re-grant the SAME key with a higher maxSpend. grantSession resets
+  // `spent` to 0 and refreshes the 24h expiry, so the new remaining budget is exactly newMaxSpendWei.
+  // The key already holds gas, so no top-up here. Approve more allowance only if the raise crosses it.
+  function doTopUpBudget(keyAddr, newMaxSpendWei, status) {
+    var from = S.acct, prov = PX.wallet.provider;
+    var expiry = Math.floor(Date.now() / 1000) + 86340; // ~24h, matches doEnable
+    return PX.allowance(from, PX.NET.book).then(function (a) {
+      return a >= newMaxSpendWei ? null : PXSession.approve(prov, from, newMaxSpendWei);
+    }).then(function () {
+      status("Grant the higher budget — confirm in wallet…");
+      return PXSession.grant(prov, from, keyAddr, expiry, newMaxSpendWei);
+    }).then(function () {
+      status("Budget topped up — session refreshed to 24h.");
+      flyPoints("⚡ +BUDGET", PAL.ok, "up");
+    }).catch(function (e) { status(txErr(e, "Top-up failed.")); throw e; });
   }
   if (el.autobtn) el.autobtn.onclick = showAuto;
 
