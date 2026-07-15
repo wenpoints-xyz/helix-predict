@@ -14,8 +14,8 @@
       key: "test", name: "Injective Testnet", chainIdHex: "0x59f", // 1439
       rpc: "https://k8s.testnet.json-rpc.injective.network/",
       explorer: "https://testnet.blockscout.injective.network",
-      book: "0xBF93EF18F0000f2CFCbeE2535560833673696009",  // PredictionBook (per-user positions + session-key openBetFor)
-      vault: "0x1b0C8FF70237caF0a46C51FcBd8FBe57C69D93D7", // HouseVault (LP) — fresh, wired to the Book
+      book: "0x2cfE1841F28256282F7904C0eE56d18ffF437a3d",  // PredictionBook v3 (payable bets, fee escrow)
+      vault: "0x58Ab94Cb3a5CaB117a32019cd3D1F7bF01bcB541", // HouseVault (LP) — fresh, wired to the v3 Book
       points: "0x52045F671C452b7f91a7e436c64f126E78638F14", // MockPoints — has a faucet
       live: true,
       faucet: true,        // MockPoints can be minted for free (test money)
@@ -26,9 +26,9 @@
       key: "prod", name: "Injective Mainnet", chainIdHex: "0x6f0", // 1776
       rpc: "https://sentry.evm-rpc.injective.network/",
       explorer: "https://blockscout.injective.network",
-      // Audited PredictionBook stack + session-key openBetFor, redeployed 2026-07-12. Stake = real $HELIXPOINT (18-dec).
-      book: "0x8034a103CaA6c2982995d39E6A95F83B367738d0",  // PredictionBook (mainnet, session-key openBetFor)
-      vault: "0x6C1b8C5a92834aBA324ee3DBEABBA9A2788B1637", // HouseVault (mainnet, fresh — re-LP required)
+      // PredictionBook v3 (bettor-funded settlement: payable bets prepay the oracle fee), redeployed 2026-07-15.
+      book: "0x45dB6aB51EF1C885ffF6e7bc76ff9221dC37a4f2",  // PredictionBook v3 (mainnet)
+      vault: "0x629E528096B34ea0a530DC41F80dE32222c4c07b", // HouseVault (mainnet, fresh — re-LP required)
       points: "0xAB3cc28e85056D5AB8f858F322a06AA6f9Eb64BD", // $HELIXPOINT ERC20 — the stake token
       live: true,
       faucet: false,       // NO faucet — HELIXPOINT is real; users buy it (see buyUrl)
@@ -52,8 +52,10 @@
 
   // ---- selectors (PredictionBook) ----
   var SEL = {
-    openBet: "0x058a345d",       // openBet(uint256 marketId,bool up,uint256 stake,uint64 dur)
+    openBet: "0x058a345d",       // openBet(uint256 marketId,bool up,uint256 stake,uint64 dur) — PAYABLE (v3 fee escrow)
     claim: "0x379607f5",         // claim(uint256 betId)
+    claimMany: "0x925489a8",     // claimMany(uint256[] betIds) — CASH OUT ALL
+    openCost: "0x5073a663",      // openCost() -> INJ each bet must prepay for its settlement (v3)
     voidExpired: "0xb04fe3fa",   // voidExpired(uint256 betId) — refund hatch past grace / while paused
     positionsOf: "0xdc9d54ef",   // positionsOf(address,uint256 start,uint256 count) -> (uint256[] ids,uint256 total)
     getPosition: "0xeb02c301",   // getPosition(uint256) -> Position
@@ -109,10 +111,10 @@
   function ethCall(to, data) { return rpc("eth_call", [{ to: to, data: data }, "latest"]); }
 
   // ---- decoders ----
-  // getPosition(betId) -> Position (11 STATIC fields, encoded inline)
+  // getPosition(betId) -> Position (12 STATIC fields, encoded inline; +feeEscrow in v3)
   function decodePosition(id, hex) {
     var w = words(hex);
-    if (w.length < 11) return null;
+    if (w.length < 12) return null;
     return {
       betId: id,
       bettor: "0x" + w[0].slice(24),
@@ -125,7 +127,8 @@
       strikeInstant: Number(big(w[7])), // unix s; first tick >= this = the entry strike
       dur: Number(big(w[8])),           // N seconds; close instant = strikeInstant + dur
       strike: sInt(w[9]),               // raw Pyth int64 (0 until settled)
-      close: sInt(w[10])
+      close: sInt(w[10]),
+      feeEscrow: big(w[11])             // v3: INJ prepaid at open to fund this bet's settle
     };
   }
   // positionsOf(user,start,count) -> (uint256[] ids, uint256 total)
@@ -186,6 +189,7 @@
     });
   }
   function owed(id) { return ethCall(NET.book, SEL.owed + u256(id)).then(function (h) { return BigInt(h); }); }
+  function openCost() { return ethCall(NET.book, SEL.openCost).then(function (h) { return BigInt(h); }); } // v3: INJ each bet prepays
   function reserveFor(stakeWei) { return ethCall(NET.book, SEL.reserveFor + u256(stakeWei)).then(function (h) { return BigInt(h); }); }
   function _param(sel) { return ethCall(NET.book, sel).then(function (h) { return BigInt(h); }); }
   // Batch the config the UI needs (odds, stake bounds, duration bounds) in one go.
@@ -214,10 +218,15 @@
     if (value) p.value = "0x" + BigInt(value).toString(16);
     return provider.request({ method: "eth_sendTransaction", params: [p] });
   }
-  function openBet(provider, from, marketId, up, stakeWei, dur) {
-    return tx(provider, from, NET.book, SEL.openBet + u256(marketId) + bool32(up) + u256(stakeWei) + u256(dur));
+  function openBet(provider, from, marketId, up, stakeWei, dur, valueWei) {
+    return tx(provider, from, NET.book, SEL.openBet + u256(marketId) + bool32(up) + u256(stakeWei) + u256(dur), valueWei);
   }
   function claim(provider, from, betId) { return tx(provider, from, NET.book, SEL.claim + u256(betId)); }
+  // CASH OUT ALL: claimMany(uint256[]) — one dynamic array arg: head offset (0x20), length, then elements.
+  function claimMany(provider, from, betIds) {
+    var body = u256(32) + u256(betIds.length) + betIds.map(function (id) { return u256(id); }).join("");
+    return tx(provider, from, NET.book, SEL.claimMany + body);
+  }
   function voidExpired(provider, from, betId) { return tx(provider, from, NET.book, SEL.voidExpired + u256(betId)); }
   function faucet(provider, from, amountWei) { return tx(provider, from, NET.points, SEL.faucet + u256(amountWei)); }
   function approve(provider, from, spender, amountWei) { return tx(provider, from, NET.points, SEL.approve + addr32(spender) + u256(amountWei)); }
@@ -327,10 +336,10 @@
   window.PX = {
     NET: NET, RESULT: RESULT,
     markets: markets, marketsLength: marketsLength, bookConfig: bookConfig,
-    myPositions: myPositions, getPosition: getPosition, positionsLength: positionsLength, positionsPage: positionsPage, owed: owed, reserveFor: reserveFor,
+    myPositions: myPositions, getPosition: getPosition, positionsLength: positionsLength, positionsPage: positionsPage, owed: owed, openCost: openCost, reserveFor: reserveFor,
     balanceOf: balanceOf, allowance: allowance, nativeBalance: nativeBalance,
     houseStats: houseStats, vaultShares: vaultShares, vaultMaxWithdraw: vaultMaxWithdraw,
-    openBet: openBet, claim: claim, voidExpired: voidExpired, faucet: faucet, approve: approve,
+    openBet: openBet, claim: claim, claimMany: claimMany, voidExpired: voidExpired, faucet: faucet, approve: approve,
     vaultDeposit: vaultDeposit, vaultWithdraw: vaultWithdraw,
     payout: payout, potentialWin: potentialWin, toChips: toChips, chipsToWei: chipsToWei,
     // Global leaderboard JSON (indexer-published, CDN). Cache-busted so a fresh board shows within its

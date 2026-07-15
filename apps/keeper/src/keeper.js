@@ -48,7 +48,11 @@ const BOOK_ABI = [
   "function settleMany(uint256[] betIds, bytes[][] strikeData, bytes[][] closeData) payable",
   "function voidExpired(uint256 betId)"
 ];
-const PYTH_ABI = ["function getUpdateFee(bytes[] updateData) view returns (uint256)"];
+const PYTH_ABI = [
+  "function getUpdateFee(bytes[] updateData) view returns (uint256)",
+  "function singleUpdateFeeInWei() view returns (uint256)"
+];
+const FEE_WATCH_MS = 300000; // re-check the Pyth per-update fee every 5 min (v3 escrow is sized off it)
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = makeWallet();
@@ -235,10 +239,31 @@ function startBlockFeed(onBlock) {
   };
 }
 
+// v3: each bet prepays its settlement in INJ, sized on-chain from pyth.singleUpdateFeeInWei() × a
+// buffer. If Pyth RAISES that fee past the buffer, already-open bets' escrow undersizes the reimbursement
+// and the keeper goes back to bleeding on them. This just SHOUTS on a change so the owner can bump
+// feeBufferBps (setFeeParams) for new bets; the keeper needs no other v3 change (the book reimburses it).
+async function watchPythFee() {
+  let last;
+  const check = async () => {
+    try {
+      const f = await pyth.singleUpdateFeeInWei();
+      if (last === undefined) log(`pyth singleUpdateFeeInWei = ${f} wei`);
+      else if (f !== last) log(`ALERT: pyth singleUpdateFeeInWei ${last} -> ${f} wei — bump feeBufferBps if it rose`);
+      last = f;
+    } catch (e) {
+      log(`fee-watch error: ${short(e)}`);
+    }
+  };
+  await check();
+  setInterval(check, FEE_WATCH_MS);
+}
+
 async function main() {
   pyth = new ethers.Contract(await book.pyth(), PYTH_ABI, provider);
   grace = Number(await book.settleGrace());
   log(`sweeper up (block-driven): book=${BOOK_ADDR} signer=${wallet.address} ws=${WSS_URL} grace=${grace}s once=${ONCE}`);
+  await watchPythFee(); // v3 fee-drift alarm (single-feed updateData is already guaranteed: hermesAt queries one id)
 
   if (ONCE) {
     await sweep();

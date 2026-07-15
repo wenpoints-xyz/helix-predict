@@ -121,10 +121,11 @@ export var core = {
 // Only wire in a browser (skipped when imported for node tests).
 if (typeof window !== "undefined") {
   // Selectors (verified against the compiled PredictionBook ABI).
-  var SEL_GRANT = "0x076fa699";      // grantSession(address,uint128,uint64,uint128)
+  var SEL_GRANT = "0x65cb5614";      // grantSession(address,uint64,uint128) — v3 dropped maxStake
+  var SEL_OPENCOST = "0x5073a663";   // openCost() -> INJ each bet prepays for its settlement (v3)
   var SEL_REVOKE = "0xc4605d8c";     // revokeSession()
   var SEL_OPENBETFOR = "0x804f7759"; // openBetFor(address,uint256,bool,uint256,uint64)
-  var SEL_SESSIONS = "0x431a1b97";   // sessions(address) -> (key,expiry,maxStake,maxSpend,spent)
+  var SEL_SESSIONS = "0x431a1b97";   // sessions(address) -> (key,expiry,maxSpend,spent) [v3: no maxStake]
   var SEL_APPROVE = "0x095ea7b3";    // approve(address,uint256) on the stake token
   var SEL_CLAIM = "0x379607f5";      // claim(uint256 betId) — permissionless, always pays the bettor
 
@@ -174,6 +175,16 @@ if (typeof window !== "undefined") {
     var p = loadKey(net, account);
     if (!p) { p = randomPrivHex(); saveKey(net, account, p); }
     return { priv: p, address: addressFromPriv(p) };
+  }
+
+  // ---- v3 open cost (INJ each bet prepays; cached like gas so it's not a per-tap round-trip) ----
+  var _oc = { v: null, at: 0 };
+  function openCostCached() {
+    var now = Date.now();
+    if (_oc.v != null && now - _oc.at < GAS_TTL) return Promise.resolve(_oc.v);
+    return rpc("eth_call", [{ to: NET().book, data: SEL_OPENCOST }, "latest"]).then(function (h) {
+      _oc.v = BigInt(h); _oc.at = now; return _oc.v;
+    });
   }
 
   // ---- gas / nonce (cached for responsiveness; the user chose no per-bet pre-flight) ----
@@ -253,7 +264,7 @@ if (typeof window !== "undefined") {
   }
 
   // ---- reads ----
-  // sessions(bettor) -> {key,expiry,maxStake,maxSpend,spent}
+  // sessions(bettor) -> {key,expiry,maxSpend,spent}  (v3: maxStake removed)
   function sessionOf(account) {
     return rpc("eth_call", [{ to: NET().book, data: SEL_SESSIONS + _addr32(account) }, "latest"]).then(function (hex) {
       hex = (hex || "").replace(/^0x/, "");
@@ -263,9 +274,8 @@ if (typeof window !== "undefined") {
         key: key,
         active: key !== "0x0000000000000000000000000000000000000000",
         expiry: Number(BigInt("0x" + w(1))),
-        maxStake: BigInt("0x" + w(2)),
-        maxSpend: BigInt("0x" + w(3)),
-        spent: BigInt("0x" + w(4))
+        maxSpend: BigInt("0x" + w(2)),
+        spent: BigInt("0x" + w(3))
       };
     });
   }
@@ -279,7 +289,7 @@ if (typeof window !== "undefined") {
       var s = r[0];
       return {
         address: addr, granted: s.active && s.key.toLowerCase() === addr.toLowerCase(),
-        key: s.key, expiry: s.expiry, maxStake: s.maxStake, maxSpend: s.maxSpend, spent: s.spent,
+        key: s.key, expiry: s.expiry, maxSpend: s.maxSpend, spent: s.spent,
         budgetLeft: s.maxSpend > s.spent ? s.maxSpend - s.spent : 0n,
         expired: s.expiry ? Date.now() / 1000 >= s.expiry : true,
         gas: r[1]
@@ -318,8 +328,8 @@ if (typeof window !== "undefined") {
   function approve(provider, from, amountWei) {
     return walletTx(provider, from, NET().points, SEL_APPROVE + _addr32(NET().book) + _u256(amountWei));
   }
-  function grant(provider, from, keyAddr, maxStakeWei, expiry, maxSpendWei) {
-    var data = SEL_GRANT + _addr32(keyAddr) + _u256(maxStakeWei) + _u256(expiry) + _u256(maxSpendWei);
+  function grant(provider, from, keyAddr, expiry, maxSpendWei) {
+    var data = SEL_GRANT + _addr32(keyAddr) + _u256(expiry) + _u256(maxSpendWei); // v3: no maxStake
     return walletTx(provider, from, NET().book, data);
   }
   function revoke(provider, from) { return walletTx(provider, from, NET().book, SEL_REVOKE); }
@@ -328,7 +338,12 @@ if (typeof window !== "undefined") {
   // ---- the no-popup bet: openBetFor signed by the session key (tap-priority in the queue) ----
   function autoBet(net, account, marketId, up, stakeWei, dur) {
     var data = SEL_OPENBETFOR + _addr32(account) + _u256(marketId) + _bool32(up) + _u256(stakeWei) + _u256(dur);
-    return sendRaw(net, account, NET().book, data, 0, GAS_LIMIT, /*hi*/ true);
+    // v3: openBetFor is payable — attach the settle-fee escrow, over-attached ~1.15x so a fee/param
+    // drift between the cached quote and the mine doesn't revert InsufficientOpenFee; the excess refunds.
+    return openCostCached().then(function (oc) {
+      var value = oc + oc / 10n + oc / 20n; // ~1.15x
+      return sendRaw(net, account, NET().book, data, value, GAS_LIMIT, /*hi*/ true);
+    });
   }
 
   // ---- the no-popup claim: claim(betId) signed by the session key (low-priority behind bets) ----
@@ -357,6 +372,6 @@ if (typeof window !== "undefined") {
     status: status, sessionOf: sessionOf, sessionGasBalance: sessionGasBalance,
     approve: approve, grant: grant, revoke: revoke, topupGas: topupGas,
     autoBet: autoBet, claim: claim, sweepGas: sweepGas, isGasFundsError: isGasFundsError,
-    GAS_LIMIT: GAS_LIMIT, CLAIM_GAS: CLAIM_GAS
+    openCost: openCostCached, GAS_LIMIT: GAS_LIMIT, CLAIM_GAS: CLAIM_GAS
   };
 }

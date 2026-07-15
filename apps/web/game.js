@@ -229,6 +229,11 @@
       refreshLp();
       refreshAuto(); // keep the ⚡ button + auto-bet gating in sync with the on-chain grant
       PX.houseStats().then(function (h) { S.house = h; }).catch(function () {}); // cache bankroll for the MAX chip clamp
+      PX.openCost().then(function (c) { // v3: INJ each bet prepays for settle
+        S.openCost = c;
+        var fl = document.getElementById("feeline");
+        if (fl) { fl.hidden = false; fl.textContent = "+ ~" + (Number(c) / 1e18).toFixed(4) + " INJ oracle fee/bet (refunded on push)"; }
+      }).catch(function () {});
     });
   }
 
@@ -322,12 +327,20 @@
     // even when the key is out of gas). fireClaim shares the dedupe guard with the auto path.
     var viaKey = act === "claim" && hasGasKey();
     el.pendingBtn.hidden = true; // debounce
-    toast(act === "claim" ? (viaKey ? "Claiming…" : "Claiming — confirm in wallet.") : "Refunding stuck bet — confirm in wallet.");
-    ids.reduce(function (chain, id) {
-      return chain.then(function () {
-        return (act === "claim" ? fireClaim(id, viaKey) : PX.voidExpired(PX.wallet.provider, S.acct, id)).catch(function () {});
-      });
-    }, Promise.resolve()).then(function () { setTimeout(poll, 2500); }).catch(function (e) { toast(txErr(e, "Failed — try again.")); });
+    toast(act === "claim" ? (viaKey ? "Claiming…" : "Cashing out — confirm in wallet.") : "Refunding stuck bet — confirm in wallet.");
+    var run;
+    if (act === "claim" && !viaKey && ids.length > 1) {
+      // CASH OUT ALL: one wallet tx drains every unclaimed win (v3 claimMany), skip-not-revert on-chain.
+      ids.forEach(function (id) { if (!S.claiming[id]) S.claiming[id] = Date.now(); });
+      run = PX.claimMany(PX.wallet.provider, S.acct, ids).catch(function () { ids.forEach(function (id) { delete S.claiming[id]; }); });
+    } else {
+      run = ids.reduce(function (chain, id) {
+        return chain.then(function () {
+          return (act === "claim" ? fireClaim(id, viaKey) : PX.voidExpired(PX.wallet.provider, S.acct, id)).catch(function () {});
+        });
+      }, Promise.resolve());
+    }
+    run.then(function () { setTimeout(poll, 2500); }).catch(function (e) { toast(txErr(e, "Failed — try again.")); });
   };
   function assetOf(marketId) {
     for (var a in S.markets) if (S.markets[a] === marketId) return a;
@@ -441,6 +454,7 @@
   // revert to plain language by matching its selector. Selectors from PredictionBook + HouseVault +
   // OZ Pausable/ERC20/ERC4626 (keccak(sig)[0:4]); keep in sync if the contract's errors change.
   var ERRMAP = {
+    "0x16637bed": "Not enough INJ for the oracle fee — top up a little INJ and retry.",
     "0xd312a688": "That's below the minimum bet.",
     "0x217b2dd1": "That's over the max bet — try a smaller stake.",
     "0x59a5f145": "You've got too many open bets — settle some first.",
@@ -509,7 +523,11 @@
     if (S.bal != null && S.bal < chips) { el.getpts.hidden = false; beep(160, 60, "sawtooth"); toast(HAS_FAUCET ? "Not enough points — hit the faucet." : "Low $HELIXPOINT — tap GET $HELIXPOINT."); return; }
     var amt = PX.chipsToWei(chips), prov = PX.wallet.provider, from = S.acct, up = side === "up", dur = S.dur;
     function walletBet() {
-      return ensureAllowance(from, amt).then(function () { return PX.openBet(prov, from, mid, up, amt, dur); });
+      // v3: openBet is payable — attach the settle-fee escrow (over-attach ~1.15x; the excess refunds
+      // on-chain so a fee/param drift between quote and mine can't revert InsufficientOpenFee).
+      return ensureAllowance(from, amt)
+        .then(function () { return S.openCost != null ? S.openCost : PX.openCost(); })
+        .then(function (oc) { var v = oc + oc / 10n + oc / 20n; return PX.openBet(prov, from, mid, up, amt, dur, v); });
     }
     function fire() {
       beep(600, 30); if (navigator.vibrate) navigator.vibrate(12);
@@ -824,8 +842,8 @@
         body.appendChild(kv("Gas", gasInj.toFixed(4) + " INJ", lowGas ? "var(--bad)" : null));
         var rowb = document.createElement("div"); rowb.style.cssText = "display:flex;gap:8px;margin-top:4px";
         var top = btn("TOP UP GAS"); top.onclick = function () {
-          status("Sending 0.05 INJ to the session key — confirm in wallet…");
-          PXSession.topupGas(PX.wallet.provider, S.acct, a.address, injWei(0.05))
+          status("Sending 0.25 INJ to the session key — confirm in wallet…");
+          PXSession.topupGas(PX.wallet.provider, S.acct, a.address, injWei(0.25))
             .then(function () { status("Gas topped up."); setTimeout(function () { refreshAuto().then(render); }, 2500); })
             .catch(function (e) { status(txErr(e, "Top-up failed.")); });
         };
@@ -857,7 +875,7 @@
         var biggest = (PX.NET.chips && PX.NET.chips[PX.NET.chips.length - 1]) || 100;
         var defBudget = Math.floor(Math.min(S.bal != null ? S.bal : biggest * 10, biggest * 10));
         var rBudget = inputRow("Session budget", defBudget, SYM);
-        var rGas = inputRow("Gas top-up", "0.05", "INJ");
+        var rGas = inputRow("Gas top-up", "0.25", "INJ");
         body.appendChild(rBudget); body.appendChild(rGas);
         body.appendChild(kv("Expires", "in 24h (revoke anytime)", null));
         var go = btn("ENABLE AUTO-BET", true); go.style.marginTop = "4px"; go.style.width = "100%";
@@ -888,15 +906,11 @@
   function short(a) { return a ? a.slice(0, 6) + "…" + a.slice(-4) : "—"; }
   function injWei(inj) { return BigInt(Math.round(inj * 1e6)) * (10n ** 12n); } // INJ is 18-dec
   // The one-time enable: approve budget (if allowance short) -> grantSession -> fund the key's gas.
-  // There is no user-facing per-bet cap: a single bet is bounded by the book's own maxBet + exposure
-  // caps, and the session by maxSpend. We still must satisfy the contract's grantSession invariants
-  // (maxStake <= maxBet AND maxSpend >= maxStake), so set maxStake = min(maxSpend, maxBet) — the
-  // largest non-binding value: it never rejects a bet the budget + book would otherwise allow.
+  // v3 dropped the per-bet maxStake wall, so grantSession takes just (key, expiry, maxSpend): a single
+  // bet is bounded by the book's own maxBet + exposure caps, and the session by the maxSpend budget.
   function doEnable(budgetChips, inj, status) {
     var from = S.acct, prov = PX.wallet.provider;
     var maxSpendWei = PX.chipsToWei(budgetChips);
-    var maxBetWei = S.cfg && S.cfg.maxBet ? S.cfg.maxBet : maxSpendWei;
-    var maxStakeWei = maxSpendWei < maxBetWei ? maxSpendWei : maxBetWei; // min(maxSpend, maxBet)
     var key = PXSession.ensureKey(PX.NET.key, from).address;
     var expiry = Math.floor(Date.now() / 1000) + 86340; // ~24h, just under MAX_SESSION to clear the bound
     status("Approve budget — confirm in wallet…");
@@ -904,7 +918,7 @@
       return a >= maxSpendWei ? null : PXSession.approve(prov, from, maxSpendWei);
     }).then(function () {
       status("Grant the session key — confirm in wallet…");
-      return PXSession.grant(prov, from, key, maxStakeWei, expiry, maxSpendWei);
+      return PXSession.grant(prov, from, key, expiry, maxSpendWei);
     }).then(function () {
       status("Fund gas (" + inj + " INJ) — confirm in wallet…");
       return PXSession.topupGas(prov, from, key, injWei(inj));
