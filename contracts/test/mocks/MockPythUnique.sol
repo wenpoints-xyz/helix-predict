@@ -1,19 +1,37 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
 import {PythStructs} from "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 import {PythErrors} from "@pythnetwork/pyth-sdk-solidity/PythErrors.sol";
 
-/// @notice Test double: the vendored MockPyth predates parsePriceFeedUpdatesUnique, so we add it
-/// here with the REAL uniqueness semantics — an update is accepted only if
+/// @notice Test double for the Injective Pyth receiver, scoped to exactly what PredictionBook calls:
+/// getUpdateFee, singleUpdateFeeInWei (v3 fee escrow), and parsePriceFeedUpdatesUnique with the REAL
+/// uniqueness semantics — an update is accepted only if
 ///     prevPublishTime < minPublishTime <= publishTime <= maxPublishTime
-/// i.e. it is the FIRST tick at/after minPublishTime. Encoding carries prevPublishTime so tests can
-/// forge a "later, cherry-picked tick" (prevPublishTime >= min) and prove it is rejected.
-contract MockPythUnique is MockPyth {
-    constructor(uint256 validTimePeriod, uint256 singleUpdateFeeInWei)
-        MockPyth(validTimePeriod, singleUpdateFeeInWei)
-    {}
+/// i.e. it is the FIRST tick at/after minPublishTime. (Standalone rather than extending the vendored
+/// MockPyth: that keeps its per-update fee in a PRIVATE field named `singleUpdateFeeInWei`, which
+/// collides with the public getter v3 needs — and the vendored lib is a pinned submodule.)
+contract MockPythUnique {
+    uint256 public immutable feeWei; // per single price update, in wei
+
+    constructor(
+        uint256,
+        /*validTimePeriod (unused)*/
+        uint256 singleFeeWei
+    ) {
+        feeWei = singleFeeWei;
+    }
+
+    /// @dev Present on the real deployed receiver (absent from the vendored IPyth interface); v3 sizes
+    /// each bet's settle-fee escrow from it.
+    function singleUpdateFeeInWei() external view returns (uint256) {
+        return feeWei;
+    }
+
+    /// @dev getUpdateFee = number of price updates in the blob × the single-update fee.
+    function getUpdateFee(bytes[] calldata updateData) public view returns (uint256) {
+        return feeWei * updateData.length;
+    }
 
     /// @dev Build a Unique-style update. `prevPublishTime` is the publishTime of the tick BEFORE this
     /// one; for an honest "first tick >= T" update, set prevPublishTime = T-1 (i.e. < T).

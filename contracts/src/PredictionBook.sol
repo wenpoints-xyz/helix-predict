@@ -23,6 +23,9 @@ interface IPythUnique {
         uint64 minPublishTime,
         uint64 maxPublishTime
     ) external payable returns (PythStructs.PriceFeed[] memory priceFeeds);
+    /// @dev Also missing from the vendored IPyth interface (like Unique above); present on the deployed
+    /// Pyth receiver. The INJ cost of ONE price update — v3 sizes each bet's settle-fee escrow from it.
+    function singleUpdateFeeInWei() external view returns (uint256);
 }
 
 /// @title PredictionBook
@@ -62,6 +65,8 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     uint256 public constant MAX_EXPOSURE_BPS = 5000; // caps can never exceed 50% of the bankroll
     uint64 public constant MIN_SETTLE_GRACE = 60; // grace floor: keeper always gets >=60s before a void race
     uint64 public constant MAX_SESSION = 24 hours; // hard cap on a session-key grant's lifetime
+    uint256 public constant MAX_FEE_BUFFER_BPS = 5000; // fee-escrow buffer can never exceed 50%
+    uint256 public constant GAS_COMP_CAP_MULT = 3; // gasComp <= 3x a single Pyth update fee (rent-lever bound)
 
     IPyth public immutable pyth;
     HouseVault public immutable vault;
@@ -82,6 +87,9 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     uint64 public strikeDelay; // Δ: future lead from open to strikeInstant (s)
     uint64 public settleTol; // TOL: Unique upper-bound window past each instant (s)
     uint64 public settleGrace; // after strikeInstant+dur+grace, anyone may voidExpired()
+    // ---- v3 fee escrow (owner-tunable, hard-capped) ----
+    uint256 public feeBufferBps; // headroom over 2 Pyth updates, absorbs fee drift between open & settle
+    uint256 public gasCompWei; // flat INJ paid to the settler for gas, on top of the actual Pyth fee
 
     enum Result {
         Open,
@@ -115,18 +123,20 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         uint64 dur; // N seconds; close anchor = strikeInstant + dur
         int64 strike; // pinned at settle (0 until then)
         int64 close; // pinned at settle
+        uint128 feeEscrow; // slot 3: INJ prepaid at open to fund this bet's settlement (v3)
     }
 
     /// @dev A browser session key a bettor authorises to open bets on their behalf (openBetFor), so the
     /// arcade UI can fire bets without a wallet popup per tap. Blast radius of a stolen key is bounded by
-    /// THREE on-chain walls: maxSpend (cumulative-stake budget, decoupled from the ERC20 allowance),
-    /// maxStake (per bet), and expiry (<= now + MAX_SESSION). revokeSession() kills it instantly.
+    /// TWO on-chain walls: maxSpend (cumulative-stake budget, decoupled from the ERC20 allowance) and
+    /// expiry (<= now + MAX_SESSION). revokeSession() kills it instantly. (v3 dropped the per-bet maxStake
+    /// wall: it was redundant — a single bet is already capped by the global maxBet + exposure caps, and
+    /// the frontend never surfaced it. A single openBetFor can now spend up to min(maxSpend, maxBet).)
     struct Session {
         address key; // slot 0: 160 + 64
         uint64 expiry; // grant dies at this timestamp
-        uint128 maxStake; // slot 1: 128 + 128 — max single stake this key may open
-        uint128 maxSpend; // cumulative-stake budget: sum of stakes opened via this key may not exceed it
-        uint128 spent; // slot 2: monotonic odometer of stake wagered via this key (reset on re-grant)
+        uint128 maxSpend; // slot 1: cumulative-stake budget; sum of stakes opened via this key may not exceed it
+        uint128 spent; // monotonic odometer of stake wagered via this key (reset on re-grant)
     }
 
     Market[] public markets;
@@ -134,6 +144,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     mapping(address => uint256) public openCount; // concurrent OPEN positions
     mapping(address => uint256[]) private _userPositions; // all betIds per user (paged views)
     mapping(uint256 => uint256) public owed; // betId => amount the bettor can claim (pull payment)
+    mapping(address => uint256) public owedInj; // address => native INJ they can claim (pull fallback, v3)
     mapping(address => Session) public sessions; // bettor => their one active session-key grant
     address private _activeSettler; // set for the duration of a settleMany batch (self-call routing)
 
@@ -178,9 +189,9 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         uint256 tip
     );
     event Claimed(uint256 indexed betId, address indexed bettor, uint256 amount);
-    event SessionGranted(
-        address indexed bettor, address indexed key, uint128 maxStake, uint64 expiry, uint128 maxSpend
-    );
+    event ClaimedInj(address indexed to, uint256 amount);
+    event FeeParamsSet(uint256 feeBufferBps, uint256 gasCompWei);
+    event SessionGranted(address indexed bettor, address indexed key, uint64 expiry, uint128 maxSpend);
     event SessionRevoked(address indexed bettor, address indexed key);
 
     error PayoutOutOfRange();
@@ -205,8 +216,8 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     error BadSession();
     error NotSessionKey();
     error SessionExpired();
-    error SessionStakeExceeded();
     error SessionBudgetExceeded();
+    error InsufficientOpenFee(); // openBet/openBetFor msg.value < the required settle-fee escrow (v3)
 
     constructor(
         IPyth _pyth,
@@ -240,6 +251,20 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         strikeDelay = 3;
         settleTol = 5;
         settleGrace = 1 hours;
+        feeBufferBps = 1000; // 10% headroom over the 2 Pyth updates
+        gasCompWei = 5e14; // 0.0005 INJ flat settler gas comp (owner retunes via setFeeParams within caps)
+    }
+
+    /// @notice Tune the settle-fee escrow sizing. Bettors prepay `openCost()` at open; the settler is
+    /// reimbursed at settle. Both knobs are hard-capped so a malicious owner can't turn the oracle fee
+    /// into an unbounded per-bet INJ skim: buffer <= 50%, gasComp <= 3x a single Pyth update fee.
+    /// Snapshotted per bet at open (p.feeEscrow), so a change never affects already-open bets.
+    function setFeeParams(uint256 _feeBufferBps, uint256 _gasCompWei) external onlyOwner {
+        if (_feeBufferBps > MAX_FEE_BUFFER_BPS) revert BadParams();
+        if (_gasCompWei > GAS_COMP_CAP_MULT * _singleUpdateFee()) revert BadParams();
+        feeBufferBps = _feeBufferBps;
+        gasCompWei = _gasCompWei;
+        emit FeeParamsSet(_feeBufferBps, _gasCompWei);
     }
 
     // ---- admin ----
@@ -345,6 +370,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     /// blind. Escrows the stake and locks ⌈(m−1)·stake⌉ on the vault under the exposure caps.
     function openBet(uint256 marketId, bool up, uint256 stake, uint64 dur)
         external
+        payable
         nonReentrant
         whenNotPaused
         returns (uint256 betId)
@@ -358,6 +384,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     /// the position/winnings accrue to the BETTOR — the session key only signs + pays its own gas.
     function openBetFor(address bettor, uint256 marketId, bool up, uint256 stake, uint64 dur)
         external
+        payable
         nonReentrant
         whenNotPaused
         returns (uint256 betId)
@@ -365,12 +392,11 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         Session storage s = sessions[bettor];
         if (msg.sender != s.key) revert NotSessionKey();
         if (block.timestamp >= s.expiry) revert SessionExpired();
-        if (stake > s.maxStake) revert SessionStakeExceeded();
         // Monotonic budget odometer: cap TOTAL stake wagered via this key, decoupled from the ERC20
-        // allowance (which stays large for manual-betting UX). stake <= maxStake <= maxBet, so it fits
-        // uint128; the checked add reverts on the impossible overflow. NOT reduced on wins — else a
-        // stolen key could churn break-even bets forever under the same budget.
-        // forge-lint: disable-next-line(unsafe-typecast) — stake <= maxStake (uint128) so it fits uint128
+        // allowance (which stays large for manual-betting UX). _open enforces stake <= maxBet (so it
+        // fits uint128); the checked add reverts on the impossible overflow. NOT reduced on wins — else
+        // a stolen key could churn break-even bets forever under the same budget.
+        if (stake > maxBet) revert BetTooBig(); // bound BEFORE the uint128 cast (maxStake wall is gone)
         uint128 newSpent = s.spent + uint128(stake);
         if (newSpent > s.maxSpend) revert SessionBudgetExceeded();
         s.spent = newSpent;
@@ -391,6 +417,11 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         if (stake > maxBet) revert BetTooBig();
         if (dur < minDur || dur > maxDur) revert BadDuration();
         if (openCount[bettor] >= maxOpenPerUser) revert TooManyOpen();
+
+        // v3: the bet prepays its own settlement in INJ (msg.value). Snapshot the required escrow now so
+        // a later fee/param change never touches this bet; refund any excess at the end.
+        uint256 feeEscrow = _openCost();
+        if (msg.value < feeEscrow) revert InsufficientOpenFee();
 
         uint256 m = payoutBps;
         uint256 reserve = _ceilDiv(stake * (m - BPS), BPS); // ⌈(m−1)·stake⌉, no netting
@@ -418,26 +449,26 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
                 strikeInstant: strikeInstant,
                 dur: dur,
                 strike: 0,
-                close: 0
+                close: 0,
+                feeEscrow: feeEscrow.toUint128()
             })
         );
         openCount[bettor] += 1;
         _userPositions[bettor].push(betId);
         // forge-lint: disable-next-line(unsafe-typecast) — m <= MAX_PAYOUT_BPS (19900) fits uint32
         emit BetOpened(betId, bettor, marketId, up, stake, strikeInstant, dur, uint32(m), reserve);
+        _refund(msg.value - feeEscrow); // return the bettor's over-attach (reverts if they can't receive)
     }
 
     /// @notice Authorise a browser `key` to open bets on the caller's behalf (openBetFor). Overwrites
-    /// any prior grant and RESETS the spend odometer. `maxSpend` (cumulative stake) is the real risk
-    /// budget; `maxStake` caps a single bet; `expiry` must be within MAX_SESSION. One grant per bettor.
-    function grantSession(address key, uint128 maxStake, uint64 expiry, uint128 maxSpend) external {
+    /// any prior grant and RESETS the spend odometer. `maxSpend` (cumulative stake) is the risk budget;
+    /// `expiry` must be within MAX_SESSION. One grant per bettor.
+    function grantSession(address key, uint64 expiry, uint128 maxSpend) external {
         if (key == address(0)) revert BadSession();
         if (expiry <= block.timestamp || expiry > block.timestamp + MAX_SESSION) revert BadSession();
-        if (maxStake == 0 || uint256(maxStake) > maxBet) revert BadSession();
-        if (maxSpend < maxStake) revert BadSession();
-        sessions[msg.sender] =
-            Session({key: key, expiry: expiry, maxStake: maxStake, maxSpend: maxSpend, spent: 0});
-        emit SessionGranted(msg.sender, key, maxStake, expiry, maxSpend);
+        if (maxSpend == 0) revert BadSession();
+        sessions[msg.sender] = Session({key: key, expiry: expiry, maxSpend: maxSpend, spent: 0});
+        emit SessionGranted(msg.sender, key, expiry, maxSpend);
     }
 
     /// @notice Instantly kill the caller's session key. NOT whenNotPaused-gated — a user must always be
@@ -458,7 +489,7 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
     {
         uint256 fee = _totalFee(strikeData, closeData);
         if (msg.value < fee) revert InsufficientFee();
-        _settle(betId, strikeData, closeData, msg.sender);
+        _settle(betId, strikeData, closeData, msg.sender, fee);
         _refund(msg.value - fee);
     }
 
@@ -501,16 +532,20 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         payable
     {
         if (msg.sender != address(this)) revert OnlySelf();
-        _settle(betId, strikeData, closeData, _activeSettler);
+        _settle(betId, strikeData, closeData, _activeSettler, _totalFee(strikeData, closeData));
     }
 
-    function _settle(uint256 betId, bytes[] calldata strikeData, bytes[] calldata closeData, address settler)
-        internal
-    {
+    function _settle(
+        uint256 betId,
+        bytes[] calldata strikeData,
+        bytes[] calldata closeData,
+        address settler,
+        uint256 pythFee
+    ) internal {
         Position storage p = positions[betId];
         if (p.result != Result.Open) revert NotOpen();
         (int64 strike, int64 close, bool voidIt) = _readOutcome(p, strikeData, closeData);
-        _resolve(p, betId, settler, strike, close, voidIt);
+        _resolve(p, betId, settler, strike, close, voidIt, pythFee);
     }
 
     /// @dev Maturity check + both Unique reads + confidence/tie evaluation. Split out to keep the
@@ -552,7 +587,8 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         address settler,
         int64 strike,
         int64 close,
-        bool voidIt
+        bool voidIt,
+        uint256 pythFee
     ) internal {
         uint256 stake = p.stake;
         uint256 tip = _tip(stake, p.payoutBps);
@@ -587,6 +623,15 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         if (tip > 0) stakeToken.safeTransfer(settler, tip); // settler paid on every path
         if (vaultPull > 0) vault.payWinnings(address(this), vaultPull);
         if (vaultReturn > 0) stakeToken.safeTransfer(address(vault), vaultReturn);
+        // v3 INJ settle-fee escrow: the two Pyth reads already ran (in _readOutcome, BEFORE this) and
+        // were paid from the settler's msg.value — so escrow NEVER funds Pyth. Now reimburse the settler
+        // their fronted fee + gasComp from THIS bet's escrow, and refund the unused buffer to the bettor.
+        // Both go through _payInj (best-effort .call, else owedInj) so a reverting wallet can't brick settle.
+        uint256 esc = p.feeEscrow;
+        uint256 reimb = pythFee + gasCompWei;
+        if (reimb > esc) reimb = esc; // Pyth fee rose past the buffer -> settler eats the bounded sliver
+        _payInj(settler, reimb);
+        _payInj(p.bettor, esc - reimb); // buffer surplus back to the bettor, not the settler
         emit BetSettled(betId, settler, strike, close, result, payout, tip);
     }
 
@@ -619,6 +664,9 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
 
         vault.release(p.reserve);
         if (tip > 0) stakeToken.safeTransfer(msg.sender, tip);
+        // v3: a void reads NO oracle, so the whole settle-fee escrow is unused -> refund it to the bettor
+        // (via _payInj so a reverting bettor wallet can't brick this permissionless liveness hatch).
+        _payInj(p.bettor, p.feeEscrow);
         emit BetSettled(betId, msg.sender, 0, 0, Result.Void, payout, tip);
     }
 
@@ -630,6 +678,32 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         address bettor = positions[betId].bettor;
         stakeToken.safeTransfer(bettor, amount);
         emit Claimed(betId, bettor, amount);
+    }
+
+    /// @notice Claim many bets' proceeds in one tx (CASH OUT ALL). Skip-not-revert on already-claimed /
+    /// unowed ids so one stale id can't block the batch. Each pays the bet's own bettor. Zeroes before
+    /// transfer; nonReentrant.
+    function claimMany(uint256[] calldata betIds) external nonReentrant {
+        for (uint256 i; i < betIds.length; i++) {
+            uint256 betId = betIds[i];
+            uint256 amount = owed[betId];
+            if (amount == 0) continue; // already claimed / nothing owed -> skip
+            owed[betId] = 0;
+            address bettor = positions[betId].bettor;
+            stakeToken.safeTransfer(bettor, amount);
+            emit Claimed(betId, bettor, amount);
+        }
+    }
+
+    /// @notice Pull native INJ credited to the caller when a best-effort refund/reimbursement .call
+    /// failed (a reverting wallet on a void escrow refund, a settle buffer surplus, or a settler reimb).
+    function claimInj() external nonReentrant {
+        uint256 amount = owedInj[msg.sender];
+        if (amount == 0) revert NothingToClaim();
+        owedInj[msg.sender] = 0;
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert RefundFailed();
+        emit ClaimedInj(msg.sender, amount);
     }
 
     // ---- views ----
@@ -706,6 +780,12 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         sharePrice = vault.convertToAssets(1e18);
     }
 
+    /// @notice The INJ a bettor must attach to openBet/openBetFor at this instant (the settle-fee escrow).
+    /// The frontend reads this and over-attaches a slippage margin; the contract refunds the excess.
+    function openCost() external view returns (uint256) {
+        return _openCost();
+    }
+
     // ---- internal ----
     /// @dev Settler tip = tipBps of stake, capped by maxTip AND by the bet's OWN snapshot edge.
     /// The snapshot-edge cap is the load-bearing one: payoutBps is fixed per bet at open, but tipBps
@@ -753,6 +833,27 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         if (amount == 0) return;
         (bool ok,) = payable(msg.sender).call{value: amount}("");
         if (!ok) revert RefundFailed();
+    }
+
+    function _singleUpdateFee() internal view returns (uint256) {
+        return IPythUnique(address(pyth)).singleUpdateFeeInWei();
+    }
+
+    /// @dev The v3 settle-fee escrow required at open: 2 Pyth updates (strike + close) × the fee-drift
+    /// buffer, plus a flat gas comp for the settler. Sized for SINGLE-FEED updateData — the keeper must
+    /// post one price ID per read (getUpdateFee = numFeeds × single), or a multi-feed blob overruns this.
+    function _openCost() internal view returns (uint256) {
+        return 2 * _singleUpdateFee() * (BPS + feeBufferBps) / BPS + gasCompWei;
+    }
+
+    /// @dev Send native INJ best-effort; on failure credit a pull mapping and RETURN (never revert the
+    /// caller). This is the one path for all bettor/settler-bound native value (void escrow refund,
+    /// settle buffer surplus, settler reimbursement) so a reverting wallet can never brick a state
+    /// transition — critical for the permissionless voidExpired liveness hatch and for settle.
+    function _payInj(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok,) = payable(to).call{value: amount}("");
+        if (!ok) owedInj[to] += amount;
     }
 
     function _bps(uint256 x, uint256 bps) internal pure returns (uint256) {

@@ -46,6 +46,7 @@ contract Handler is Test {
     uint256 public gClaimed;
     uint256 public gTips;
     uint256 public gOpenReserve; // running sum of reserves on OPEN positions
+    uint256 public gOpenEscrow; // running sum of INJ feeEscrow on OPEN positions (v3)
 
     receive() external payable {}
 
@@ -67,6 +68,7 @@ contract Handler is Test {
         }
         for (uint256 i; i < bettors.length; i++) {
             token.mint(bettors[i], 1_000_000 ether);
+            vm.deal(bettors[i], 1_000 ether); // v3: bettors fund each bet's INJ settle-fee escrow
         }
     }
 
@@ -113,9 +115,10 @@ contract Handler is Test {
         uint64 dur = uint64(bound(durSeed, book.minDur(), book.maxDur()));
         vm.startPrank(b);
         token.approve(address(book), amt);
-        try book.openBet(marketId, up, amt, dur) returns (uint256 betId) {
+        try book.openBet{value: book.openCost()}(marketId, up, amt, dur) returns (uint256 betId) {
             gStakeIn += amt;
             gOpenReserve += book.getPosition(betId).reserve;
+            gOpenEscrow += book.getPosition(betId).feeEscrow;
             openBets.push(betId);
         } catch {}
         vm.stopPrank();
@@ -133,6 +136,7 @@ contract Handler is Test {
         uint256 tipBefore = token.balanceOf(address(this));
         try book.settle{value: 2}(id, _uupd(STRIKE, sAt, sAt - 1), _uupd(close, cAt, cAt - 1)) {
             gOpenReserve -= p.reserve;
+            gOpenEscrow -= p.feeEscrow;
             gTips += token.balanceOf(address(this)) - tipBefore;
             if (book.owed(id) > 0) claimable.push(id);
             _removeOpen(idx);
@@ -149,6 +153,7 @@ contract Handler is Test {
         uint256 tipBefore = token.balanceOf(address(this));
         try book.voidExpired(id) {
             gOpenReserve -= p.reserve;
+            gOpenEscrow -= p.feeEscrow;
             gTips += token.balanceOf(address(this)) - tipBefore;
             if (book.owed(id) > 0) claimable.push(id);
             _removeOpen(idx);
@@ -216,5 +221,35 @@ contract PredictionBookInvariantTest is StdInvariant, Test {
         uint256 expected = SEED + handler.gDeposited() + handler.gStakeIn() - handler.gWithdrawn()
             - handler.gClaimed() - handler.gTips();
         assertEq(held, expected, "INV-3: value not conserved");
+    }
+
+    /// INV-4 (v3 escrow conservation): the book's native INJ balance between calls equals exactly the
+    /// sum of feeEscrow over OPEN positions. No escrow leaks, none funds Pyth (settler msg.value does),
+    /// and every settle/void releases exactly the settled bet's escrow. (Bettors/settler here are EOAs
+    /// that accept INJ, so nothing parks in owedInj; if that changes, add owedInj to the RHS.)
+    function invariant_EscrowConserved() public view {
+        assertEq(address(book).balance, handler.gOpenEscrow(), "INV-4: INJ escrow not conserved");
+    }
+}
+
+contract HandlerOpensLandTest is Test {
+    function test_opensLand() public {
+        MockPythUnique pyth = new MockPythUnique(60, 1);
+        MockERC20I token = new MockERC20I();
+        HouseVault vault = new HouseVault(IERC20(address(token)), "H", "h");
+        PredictionBook book =
+            new PredictionBook(IPyth(address(pyth)), vault, 19500, 3000, 4000, 1 ether, 50_000 ether);
+        vault.setHouse(address(book));
+        uint256 mid = book.addMarket(0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43);
+        token.mint(address(this), 1_000_000 ether);
+        token.approve(address(vault), type(uint256).max);
+        vault.deposit(500_000 ether, address(this));
+        vm.warp(1_000_000);
+        Handler h = new Handler(book, vault, token, pyth, mid);
+        h.open(0, true, 100 ether, 30);
+        h.open(1, false, 50 ether, 60);
+        assertGt(book.positionsLength(), 0, "opens must land now (payable)");
+        assertGt(h.gOpenEscrow(), 0, "escrow tracked");
+        assertEq(address(book).balance, h.gOpenEscrow(), "book INJ == tracked escrow");
     }
 }

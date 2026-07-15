@@ -18,6 +18,22 @@ contract MockERC20 is ERC20 {
     }
 }
 
+/// @dev A bettor contract with NO receive/fallback: it can open bets but CANNOT accept native INJ, so
+/// the v3 escrow refund .call to it fails — exercising the _payInj pull fallback (owedInj) that keeps
+/// voidExpired/settle from being bricked by a hostile wallet.
+contract NoReceive {
+    PredictionBook book;
+
+    constructor(PredictionBook b, IERC20 t) {
+        book = b;
+        t.approve(address(b), type(uint256).max);
+    }
+
+    function open(uint256 mkt, bool up, uint256 stake, uint64 dur, uint256 fee) external returns (uint256) {
+        return book.openBet{value: fee}(mkt, up, stake, dur);
+    }
+}
+
 /// @dev Tests for PredictionBook: per-user positions, future-instant strike, deterministic Unique
 /// settle, tip-from-escrow, no-netting reserve, void/expiry, caps, paged views.
 ///
@@ -39,6 +55,7 @@ contract PredictionBookTest is Test {
     uint64 constant TOL = 5; // settleTol
     uint64 constant GRACE = 1 hours;
     uint256 marketId;
+    uint256 OPEN_FEE; // book.openCost() — INJ escrow each bet prepays (v3)
 
     address lp = address(0x11D);
     address alice = address(0xA11CE);
@@ -63,6 +80,7 @@ contract PredictionBookTest is Test {
         // guards: maxConf disabled, tip 1%, no maxTip cap, 25 open, dur 5..300, Δ=3, TOL=5, grace 1h
         book.setGuards(0, 100, type(uint256).max, 25, 5, 300, DELTA, TOL, GRACE);
         marketId = book.addMarket(FEED);
+        OPEN_FEE = book.openCost(); // v3: INJ each bet must prepay for its settlement (≈ gasCompWei here)
 
         vm.warp(1_000_000);
         vm.deal(address(this), 100 ether);
@@ -76,15 +94,17 @@ contract PredictionBookTest is Test {
         address[2] memory users = [alice, bob];
         for (uint256 i; i < users.length; i++) {
             token.mint(users[i], 1_000_000 ether);
+            vm.deal(users[i], 100 ether); // v3: bettors need INJ to attach the settle-fee escrow
             vm.prank(users[i]);
             token.approve(address(book), type(uint256).max);
         }
+        vm.deal(sessionKey, 100 ether); // v3: the session key funds the escrow when it opens for a bettor
     }
 
     // ---- helpers ----
     function _open(address u, bool up, uint256 stake, uint64 dur) internal returns (uint256 betId) {
         vm.prank(u);
-        betId = book.openBet(marketId, up, stake, dur);
+        betId = book.openBet{value: OPEN_FEE}(marketId, up, stake, dur);
     }
 
     function _uupd(int64 price, uint64 conf, uint64 pt, uint64 prevPt)
@@ -133,30 +153,30 @@ contract PredictionBookTest is Test {
     function test_OpenBet_rejects() public {
         vm.prank(alice);
         vm.expectRevert(PredictionBook.BetTooSmall.selector);
-        book.openBet(marketId, true, MINBET - 1, 30);
+        book.openBet{value: OPEN_FEE}(marketId, true, MINBET - 1, 30);
 
         vm.prank(alice);
         vm.expectRevert(PredictionBook.BetTooBig.selector);
-        book.openBet(marketId, true, MAXBET + 1, 30);
+        book.openBet{value: OPEN_FEE}(marketId, true, MAXBET + 1, 30);
 
         vm.prank(alice);
         vm.expectRevert(PredictionBook.BadDuration.selector);
-        book.openBet(marketId, true, 10 ether, 4); // < minDur
+        book.openBet{value: OPEN_FEE}(marketId, true, 10 ether, 4); // < minDur
 
         vm.prank(alice);
         vm.expectRevert(PredictionBook.BadDuration.selector);
-        book.openBet(marketId, true, 10 ether, 301); // > maxDur
+        book.openBet{value: OPEN_FEE}(marketId, true, 10 ether, 301); // > maxDur
 
         vm.prank(alice);
         vm.expectRevert(PredictionBook.NoSuchMarket.selector);
-        book.openBet(99, true, 10 ether, 30);
+        book.openBet{value: OPEN_FEE}(99, true, 10 ether, 30);
     }
 
     function test_OpenBet_disabledMarket() public {
         book.setMarketEnabled(marketId, false);
         vm.prank(alice);
         vm.expectRevert(PredictionBook.MarketDisabled.selector);
-        book.openBet(marketId, true, 10 ether, 30);
+        book.openBet{value: OPEN_FEE}(marketId, true, 10 ether, 30);
     }
 
     function test_OpenBet_maxOpenCap() public {
@@ -165,7 +185,7 @@ contract PredictionBookTest is Test {
         _open(alice, true, 10 ether, 30);
         vm.prank(alice);
         vm.expectRevert(PredictionBook.TooManyOpen.selector);
-        book.openBet(marketId, true, 10 ether, 30);
+        book.openBet{value: OPEN_FEE}(marketId, true, 10 ether, 30);
     }
 
     // ---- settle: win / loss / void ----
@@ -337,7 +357,7 @@ contract PredictionBookTest is Test {
         book.setParams(M, 100, 5000, MINBET, MAXBET); // maxBetExposureBps = 1%
         vm.prank(alice);
         vm.expectRevert(PredictionBook.BetCapExceeded.selector);
-        book.openBet(marketId, true, 20_000 ether, 30); // reserve 19000 > 10000
+        book.openBet{value: OPEN_FEE}(marketId, true, 20_000 ether, 30); // reserve 19000 > 10000
     }
 
     function test_Caps_aggregateExposure() public {
@@ -345,7 +365,7 @@ contract PredictionBookTest is Test {
         _open(alice, true, 10_000 ether, 30); // reserve 9500 <= 10000 ok
         vm.prank(bob);
         vm.expectRevert(PredictionBook.AggCapExceeded.selector);
-        book.openBet(marketId, true, 10_000 ether, 30); // would push agg to 19000 > 10000
+        book.openBet{value: OPEN_FEE}(marketId, true, 10_000 ether, 30); // would push agg to 19000 > 10000
     }
 
     // ---- settleMany ----
@@ -435,8 +455,8 @@ contract PredictionBookTest is Test {
         uint256 stake = 1000 ether;
         uint256 before = token.balanceOf(eve);
         vm.startPrank(eve);
-        uint256 up = book.openBet(marketId, true, stake, 30);
-        uint256 dn = book.openBet(marketId, false, stake, 30);
+        uint256 up = book.openBet{value: OPEN_FEE}(marketId, true, stake, 30);
+        uint256 dn = book.openBet{value: OPEN_FEE}(marketId, false, stake, 30);
         vm.stopPrank();
 
         PredictionBook.Position memory p = book.getPosition(up);
@@ -514,8 +534,8 @@ contract PredictionBookTest is Test {
         uint256 S = 1000 ether;
         uint256 before = token.balanceOf(eve);
         vm.startPrank(eve);
-        uint256 up = book.openBet(marketId, true, S, 30);
-        uint256 dn = book.openBet(marketId, false, S, 30);
+        uint256 up = book.openBet{value: OPEN_FEE}(marketId, true, S, 30);
+        uint256 dn = book.openBet{value: OPEN_FEE}(marketId, false, S, 30);
         vm.stopPrank();
         // owner reconfigures: lower payout (raises live edge), then raise tip to the new edge
         book.setParams(15000, 5000, 5000, MINBET, MAXBET); // edge now 5000bps
@@ -557,28 +577,27 @@ contract PredictionBookTest is Test {
 
     // ================= session-key auto-bet (grantSession / revokeSession / openBetFor) =================
     //
-    //   grantSession(key,maxStake,expiry,maxSpend) ─► sessions[bettor]
+    //   grantSession(key,expiry,maxSpend) ─► sessions[bettor]   (v3: maxStake wall dropped)
     //   openBetFor(bettor,...) by the KEY ─► _open(bettor) : escrow from BETTOR, position under BETTOR
-    //     walls: msg.sender==key · now<expiry · stake<=maxStake · spent+stake<=maxSpend (odometer)
+    //     walls: msg.sender==key · now<expiry · spent+stake<=maxSpend (odometer)
     //   revokeSession() ─► delete (works even while paused)
 
     address sessionKey = address(0x5E5510);
 
-    function _grant(address bettor, address key, uint128 maxStake, uint64 ttl, uint128 maxSpend) internal {
+    function _grant(address bettor, address key, uint64 ttl, uint128 maxSpend) internal {
         vm.prank(bettor);
-        book.grantSession(key, maxStake, uint64(block.timestamp) + ttl, maxSpend);
+        book.grantSession(key, uint64(block.timestamp) + ttl, maxSpend);
     }
 
     function test_GrantSession_storesAndEmits() public {
         uint64 exp = uint64(block.timestamp) + 3600;
         vm.expectEmit(true, true, false, true, address(book));
-        emit PredictionBook.SessionGranted(alice, sessionKey, 100 ether, exp, 1000 ether);
+        emit PredictionBook.SessionGranted(alice, sessionKey, exp, 1000 ether);
         vm.prank(alice);
-        book.grantSession(sessionKey, 100 ether, exp, 1000 ether);
-        (address key, uint64 expiry, uint128 maxStake, uint128 maxSpend, uint128 spent) = book.sessions(alice);
+        book.grantSession(sessionKey, exp, 1000 ether);
+        (address key, uint64 expiry, uint128 maxSpend, uint128 spent) = book.sessions(alice);
         assertEq(key, sessionKey);
         assertEq(expiry, exp);
-        assertEq(maxStake, 100 ether);
         assertEq(maxSpend, 1000 ether);
         assertEq(spent, 0);
     }
@@ -589,27 +608,23 @@ contract PredictionBookTest is Test {
         uint64 nowTs = uint64(block.timestamp);
         vm.startPrank(alice);
         vm.expectRevert(PredictionBook.BadSession.selector);
-        book.grantSession(address(0), 100 ether, exp, 1000 ether); // zero key
+        book.grantSession(address(0), exp, 1000 ether); // zero key
         vm.expectRevert(PredictionBook.BadSession.selector);
-        book.grantSession(sessionKey, 100 ether, nowTs, 1000 ether); // expiry <= now
+        book.grantSession(sessionKey, nowTs, 1000 ether); // expiry <= now
         vm.expectRevert(PredictionBook.BadSession.selector);
-        book.grantSession(sessionKey, 100 ether, pastCap, 1000 ether); // > MAX_SESSION cap
+        book.grantSession(sessionKey, pastCap, 1000 ether); // > MAX_SESSION cap
         vm.expectRevert(PredictionBook.BadSession.selector);
-        book.grantSession(sessionKey, 0, exp, 1000 ether); // maxStake 0
-        vm.expectRevert(PredictionBook.BadSession.selector);
-        book.grantSession(sessionKey, uint128(MAXBET) + 1, exp, uint128(MAXBET) + 1); // maxStake > maxBet
-        vm.expectRevert(PredictionBook.BadSession.selector);
-        book.grantSession(sessionKey, 100 ether, exp, 99 ether); // maxSpend < maxStake
+        book.grantSession(sessionKey, exp, 0); // maxSpend 0
         vm.stopPrank();
     }
 
     function test_OpenBetFor_happy_escrowsFromBettor_positionUnderBettor() public {
-        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        _grant(alice, sessionKey, 3600, 1000 ether);
         uint256 stake = 50 ether;
         uint256 aliceBefore = token.balanceOf(alice);
         uint256 keyBefore = token.balanceOf(sessionKey); // 0 — the key holds no POINTS
         vm.prank(sessionKey);
-        uint256 betId = book.openBetFor(alice, marketId, true, stake, 30);
+        uint256 betId = book.openBetFor{value: OPEN_FEE}(alice, marketId, true, stake, 30);
         assertEq(token.balanceOf(address(book)), stake, "escrow held");
         assertEq(aliceBefore - token.balanceOf(alice), stake, "stake pulled from the BETTOR");
         assertEq(token.balanceOf(sessionKey), keyBefore, "session key funds untouched");
@@ -617,98 +632,110 @@ contract PredictionBookTest is Test {
         assertEq(p.bettor, alice, "position recorded under the bettor");
         assertEq(book.openCount(alice), 1);
         assertEq(book.openCount(sessionKey), 0, "session key is not the bettor");
-        (,,,, uint128 spent) = book.sessions(alice);
+        (,,, uint128 spent) = book.sessions(alice);
         assertEq(spent, stake, "spend odometer advanced by stake");
     }
 
     function test_OpenBetFor_authReverts() public {
-        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        _grant(alice, sessionKey, 3600, 1000 ether);
         vm.prank(bob); // not the key
         vm.expectRevert(PredictionBook.NotSessionKey.selector);
-        book.openBetFor(alice, marketId, true, 10 ether, 30);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 10 ether, 30);
         vm.prank(sessionKey); // bob has no session (zero key)
         vm.expectRevert(PredictionBook.NotSessionKey.selector);
-        book.openBetFor(bob, marketId, true, 10 ether, 30);
-        vm.prank(sessionKey); // over per-bet maxStake
-        vm.expectRevert(PredictionBook.SessionStakeExceeded.selector);
-        book.openBetFor(alice, marketId, true, 100 ether + 1, 30);
+        book.openBetFor{value: OPEN_FEE}(bob, marketId, true, 10 ether, 30);
+    }
+
+    /// @dev v3 removed the per-bet maxStake wall: a single openBetFor may now spend up to min(maxSpend,
+    /// maxBet). One bet of the whole budget succeeds; only maxBet (via BetTooBig) still bounds a bet.
+    function test_OpenBetFor_noMaxStakeWall_singleBetUpToBudget() public {
+        _grant(alice, sessionKey, 3600, 5000 ether);
+        vm.prank(sessionKey);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 5000 ether, 30); // whole budget in ONE bet, ok
+        (,,, uint128 spent) = book.sessions(alice);
+        assertEq(spent, 5000 ether);
+        // still bounded by the global maxBet
+        _grant(alice, sessionKey, 3600, uint128(MAXBET) + 1 ether);
+        vm.prank(sessionKey);
+        vm.expectRevert(PredictionBook.BetTooBig.selector);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, MAXBET + 1, 30);
     }
 
     function test_OpenBetFor_expiredReverts() public {
-        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        _grant(alice, sessionKey, 3600, 1000 ether);
         vm.warp(block.timestamp + 3601);
         vm.prank(sessionKey);
         vm.expectRevert(PredictionBook.SessionExpired.selector);
-        book.openBetFor(alice, marketId, true, 10 ether, 30);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 10 ether, 30);
     }
 
     function test_OpenBetFor_budgetCap_decoupledFromAllowance() public {
         // alice's ERC20 allowance to the book is unlimited (setUp), yet the session key is capped at
         // maxSpend=120: two 50s ok (spent 100), a third 50 would hit 150 > 120 -> revert.
-        _grant(alice, sessionKey, 100 ether, 3600, 120 ether);
+        _grant(alice, sessionKey, 3600, 120 ether);
         vm.startPrank(sessionKey);
-        book.openBetFor(alice, marketId, true, 50 ether, 30);
-        book.openBetFor(alice, marketId, true, 50 ether, 30);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 50 ether, 30);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 50 ether, 30);
         vm.expectRevert(PredictionBook.SessionBudgetExceeded.selector);
-        book.openBetFor(alice, marketId, true, 50 ether, 30);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 50 ether, 30);
         vm.stopPrank();
-        (,,,, uint128 spent) = book.sessions(alice);
+        (,,, uint128 spent) = book.sessions(alice);
         assertEq(spent, 100 ether, "odometer unchanged by the reverted bet");
     }
 
     function test_RevokeSession_killsKey() public {
-        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        _grant(alice, sessionKey, 3600, 1000 ether);
         vm.expectEmit(true, true, false, false, address(book));
         emit PredictionBook.SessionRevoked(alice, sessionKey);
         vm.prank(alice);
         book.revokeSession();
         vm.prank(sessionKey);
         vm.expectRevert(PredictionBook.NotSessionKey.selector);
-        book.openBetFor(alice, marketId, true, 10 ether, 30);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 10 ether, 30);
     }
 
     function test_RevokeSession_worksWhilePaused() public {
-        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        _grant(alice, sessionKey, 3600, 1000 ether);
         book.pause();
         vm.prank(alice);
         book.revokeSession(); // must NOT be whenNotPaused-gated — a user can always kill a key
-        (address key,,,,) = book.sessions(alice);
+        (address key,,,) = book.sessions(alice);
         assertEq(key, address(0), "session cleared during a pause");
     }
 
     function test_ReGrant_resetsSpent() public {
-        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        _grant(alice, sessionKey, 3600, 1000 ether);
         vm.prank(sessionKey);
-        book.openBetFor(alice, marketId, true, 50 ether, 30);
-        (,,,, uint128 spent1) = book.sessions(alice);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 50 ether, 30);
+        (,,, uint128 spent1) = book.sessions(alice);
         assertEq(spent1, 50 ether);
-        _grant(alice, address(0xBEEF), 100 ether, 3600, 1000 ether); // rotate
-        (address key,,,, uint128 spent2) = book.sessions(alice);
+        _grant(alice, address(0xBEEF), 3600, 1000 ether); // rotate
+        (address key,,, uint128 spent2) = book.sessions(alice);
         assertEq(key, address(0xBEEF));
         assertEq(spent2, 0, "odometer reset on re-grant");
     }
 
     function test_OpenBetFor_capsStillEnforced() public {
         book.setParams(M, 100, 5000, MINBET, MAXBET); // per-bet cap 1% of 1M = 10k
-        _grant(alice, sessionKey, uint128(MAXBET), 3600, uint128(MAXBET)); // session allows big; caps must still bite
+        _grant(alice, sessionKey, 3600, uint128(MAXBET)); // session allows big; caps must still bite
         vm.prank(sessionKey);
         vm.expectRevert(PredictionBook.BetCapExceeded.selector);
-        book.openBetFor(alice, marketId, true, 20_000 ether, 30); // reserve 19000 > 10000
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 20_000 ether, 30); // reserve 19000 > 10000
     }
 
     function test_OpenBetFor_whenPausedReverts() public {
-        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        _grant(alice, sessionKey, 3600, 1000 ether);
         book.pause();
         vm.prank(sessionKey);
         vm.expectRevert(); // Pausable: EnforcedPause
-        book.openBetFor(alice, marketId, true, 10 ether, 30);
+        book.openBetFor{value: OPEN_FEE}(alice, marketId, true, 10 ether, 30);
     }
 
     function test_OpenBetFor_settleAndClaim_paysBettorNotKey() public {
-        _grant(alice, sessionKey, 100 ether, 3600, 1000 ether);
+        _grant(alice, sessionKey, 3600, 1000 ether);
         uint256 stake = 100 ether;
         vm.prank(sessionKey);
-        uint256 betId = book.openBetFor(alice, marketId, true, stake, 30);
+        uint256 betId = book.openBetFor{value: OPEN_FEE}(alice, marketId, true, stake, 30);
         uint256 aliceBefore = token.balanceOf(alice);
         uint256 keyBefore = token.balanceOf(sessionKey);
         _settle(betId, 100_000, 100_001, 0, 0); // up, close > strike -> win
@@ -718,5 +745,96 @@ contract PredictionBookTest is Test {
         assertEq(token.balanceOf(alice) - aliceBefore, distributable - tip, "winnings pay the BETTOR");
         assertEq(token.balanceOf(sessionKey), keyBefore, "session key receives nothing");
         assertEq(book.openCount(alice), 0);
+    }
+
+    // ================= v3: INJ fee escrow, reimbursement, refunds, claimMany =================
+
+    function test_v3_OpenRequiresFeeEscrow_refundsExcess() public {
+        vm.deal(alice, 100 ether);
+        // below openCost -> InsufficientOpenFee
+        vm.prank(alice);
+        vm.expectRevert(PredictionBook.InsufficientOpenFee.selector);
+        book.openBet{value: OPEN_FEE - 1}(marketId, true, 10 ether, 30);
+        // exactly openCost stores it as the bet's feeEscrow
+        vm.prank(alice);
+        uint256 betId = book.openBet{value: OPEN_FEE}(marketId, true, 10 ether, 30);
+        assertEq(uint256(book.getPosition(betId).feeEscrow), OPEN_FEE, "escrow snapshotted");
+        // over-attach -> excess refunded, book holds only the escrow (+ prior bets')
+        uint256 aliceBefore = alice.balance;
+        uint256 bookBefore = address(book).balance;
+        vm.prank(alice);
+        book.openBet{value: OPEN_FEE + 3 ether}(marketId, true, 10 ether, 30);
+        assertEq(aliceBefore - alice.balance, OPEN_FEE, "only the escrow left alice; excess refunded");
+        assertEq(address(book).balance - bookBefore, OPEN_FEE, "book took only the escrow");
+    }
+
+    function test_v3_SettleReimbursesSettler_escrowNeverPaysPyth() public {
+        uint256 betId = _open(alice, true, 100 ether, 30);
+        uint256 esc = uint256(book.getPosition(betId).feeEscrow);
+        uint256 bookBefore = address(book).balance; // holds esc (+ nothing else here)
+        uint256 selfBefore = address(this).balance;
+        // settle attaches exactly the Pyth fee (2*FEE); the book reimburses the settler from escrow.
+        _settle(betId, 100_000, 100_001, 0, 0);
+        // settler (this contract) net INJ: -pythFee (fronted) + reimb(=pythFee+gasComp capped at esc).
+        // With esc = 2*FEE*1.1 + gasComp and pythFee = 2*FEE, reimb = esc (surplus 0) -> net +gasCompWei.
+        assertEq(address(this).balance - selfBefore, book.gasCompWei(), "settler netted the gas comp");
+        // the bet's whole escrow left the book (conservation): balance dropped by esc.
+        assertEq(bookBefore - address(book).balance, esc, "escrow released on settle");
+    }
+
+    function test_v3_VoidRefundsFeeEscrowToBettor() public {
+        uint256 betId = _open(alice, true, 100 ether, 30);
+        uint256 esc = uint256(book.getPosition(betId).feeEscrow);
+        PredictionBook.Position memory p = book.getPosition(betId);
+        vm.warp(p.strikeInstant + p.dur + GRACE);
+        uint256 aliceBefore = alice.balance;
+        vm.prank(bob); // permissionless post-grace void
+        book.voidExpired(betId);
+        assertEq(alice.balance - aliceBefore, esc, "void refunded the INJ escrow to the bettor");
+    }
+
+    function test_v3_VoidRevertingBettor_pullFallback_neverBricks() public {
+        NoReceive nr = new NoReceive(book, IERC20(address(token)));
+        token.mint(address(nr), 1000 ether);
+        vm.deal(address(nr), 10 ether);
+        uint256 betId = nr.open(marketId, true, 100 ether, 30, OPEN_FEE);
+        uint256 esc = uint256(book.getPosition(betId).feeEscrow);
+        PredictionBook.Position memory p = book.getPosition(betId);
+        vm.warp(p.strikeInstant + p.dur + GRACE);
+        // The escrow refund .call to nr (no receive) fails -> credited to owedInj; the void STILL completes.
+        vm.prank(bob);
+        book.voidExpired(betId);
+        assertEq(
+            uint8(book.getPosition(betId).result), uint8(PredictionBook.Result.Void), "void completed anyway"
+        );
+        assertEq(book.owedInj(address(nr)), esc, "escrow parked in the INJ pull mapping");
+    }
+
+    function test_v3_ClaimMany_batchesAndSkips() public {
+        uint256 b0 = _open(alice, true, 100 ether, 30);
+        uint256 b1 = _open(alice, true, 100 ether, 30);
+        _settle(b0, 100_000, 100_001, 0, 0); // win
+        _settle(b1, 100_000, 100_001, 0, 0); // win
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256[] memory ids = new uint256[](3);
+        ids[0] = b0;
+        ids[1] = b1;
+        ids[2] = b0; // duplicate -> second pass skips (owed already 0)
+        book.claimMany(ids);
+        uint256 tip = (100 ether * 100) / 10000;
+        uint256 each = (100 ether * M) / 10000 - tip;
+        assertEq(token.balanceOf(alice) - aliceBefore, 2 * each, "both wins paid once; dup skipped");
+        assertEq(book.owed(b0), 0);
+        assertEq(book.owed(b1), 0);
+    }
+
+    function test_v3_SetFeeParams_capsBind() public {
+        vm.expectRevert(PredictionBook.BadParams.selector);
+        book.setFeeParams(5001, 0); // buffer > 50%
+        vm.expectRevert(PredictionBook.BadParams.selector);
+        book.setFeeParams(1000, 3 * FEE + 1); // gasComp > 3x single update fee
+        book.setFeeParams(2000, 3 * FEE); // at the caps -> ok
+        assertEq(book.feeBufferBps(), 2000);
+        assertEq(book.gasCompWei(), 3 * FEE);
     }
 }
