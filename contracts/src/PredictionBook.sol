@@ -396,8 +396,8 @@ contract PredictionBook is Ownable, ReentrancyGuard, Pausable {
         // allowance (which stays large for manual-betting UX). _open enforces stake <= maxBet (so it
         // fits uint128); the checked add reverts on the impossible overflow. NOT reduced on wins — else
         // a stolen key could churn break-even bets forever under the same budget.
-        if (stake > maxBet) revert BetTooBig(); // bound BEFORE the uint128 cast (maxStake wall is gone)
-        uint128 newSpent = s.spent + uint128(stake);
+        if (stake > maxBet) revert BetTooBig(); // bound BEFORE the cast (maxStake wall is gone)
+        uint128 newSpent = s.spent + stake.toUint128(); // SafeCast: reverts (never truncates) if maxBet>uint128
         if (newSpent > s.maxSpend) revert SessionBudgetExceeded();
         s.spent = newSpent;
         return _open(bettor, marketId, up, stake, dur);
