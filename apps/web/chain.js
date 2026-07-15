@@ -14,8 +14,8 @@
       key: "test", name: "Injective Testnet", chainIdHex: "0x59f", // 1439
       rpc: "https://k8s.testnet.json-rpc.injective.network/",
       explorer: "https://testnet.blockscout.injective.network",
-      book: "0xBF93EF18F0000f2CFCbeE2535560833673696009",  // PredictionBook (per-user positions + session-key openBetFor)
-      vault: "0x1b0C8FF70237caF0a46C51FcBd8FBe57C69D93D7", // HouseVault (LP) — fresh, wired to the Book
+      book: "0x2cfE1841F28256282F7904C0eE56d18ffF437a3d",  // PredictionBook v3 (payable bets, fee escrow)
+      vault: "0x58Ab94Cb3a5CaB117a32019cd3D1F7bF01bcB541", // HouseVault (LP) — fresh, wired to the v3 Book
       points: "0x52045F671C452b7f91a7e436c64f126E78638F14", // MockPoints — has a faucet
       live: true,
       faucet: true,        // MockPoints can be minted for free (test money)
@@ -26,9 +26,9 @@
       key: "prod", name: "Injective Mainnet", chainIdHex: "0x6f0", // 1776
       rpc: "https://sentry.evm-rpc.injective.network/",
       explorer: "https://blockscout.injective.network",
-      // Audited PredictionBook stack + session-key openBetFor, redeployed 2026-07-12. Stake = real $HELIXPOINT (18-dec).
-      book: "0x8034a103CaA6c2982995d39E6A95F83B367738d0",  // PredictionBook (mainnet, session-key openBetFor)
-      vault: "0x6C1b8C5a92834aBA324ee3DBEABBA9A2788B1637", // HouseVault (mainnet, fresh — re-LP required)
+      // PredictionBook v3 (bettor-funded settlement: payable bets prepay the oracle fee), redeployed 2026-07-15.
+      book: "0x45dB6aB51EF1C885ffF6e7bc76ff9221dC37a4f2",  // PredictionBook v3 (mainnet)
+      vault: "0x629E528096B34ea0a530DC41F80dE32222c4c07b", // HouseVault (mainnet, fresh — re-LP required)
       points: "0xAB3cc28e85056D5AB8f858F322a06AA6f9Eb64BD", // $HELIXPOINT ERC20 — the stake token
       live: true,
       faucet: false,       // NO faucet — HELIXPOINT is real; users buy it (see buyUrl)
